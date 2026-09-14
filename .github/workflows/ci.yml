@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Several tests compile the generated Rust and C to prove it is valid, and
+      # skip themselves when no compiler is found. Without this step a runner
+      # missing either would report a green but much smaller suite.
+      - name: Generated-code compilers are present
+        run: |
+          rustc --version
+          cc --version
+
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked

@@ -1,0 +1,242 @@
+// flowi IDL grammar (pest). Forked from flowi_core's api_gen and trimmed: the
+// Qt-traits / crate-target surface is gone. The IDL has one way to define a type
+// (a prefix-free real `struct` / `enum` / `handle`) and one way to define an API
+// (an `api <Domain>` direct-function block); api_gen owns both the C type and the Rust
+// binding from that single source. The `callback` and `mod` constructs carried
+// over from flowi_core.
+
+chunk = _{ SOI ~ (moduledef | viewsdef | readsdef | constdef | moddef | externdef | callbackdef | structdef | enumdef | apidef | doc_comment)+ ~ EOI }
+
+// `#[module(<name>)]` — a top-level directive naming the public module this def's
+// generated C header lands in: flowi/include/flowi/<name>/ and cross-includes as
+// <flowi/<name>/x.h>. Absent => the `ui` default. Tried first in `chunk`
+// so it never collides with a struct/enum's `#[attributes(...)]` / `#[handle(...)]`.
+moduledef = { ("#[module(") ~ name ~ (")]") }
+
+// `#[views(<host module path>)]` — the host module this def's types pair with.
+// A type named `<DefPrefix><Name>` pairs with `<path>::<Name>View` by convention;
+// `#[view(...)]` on a type is the exception hatch.
+viewsdef = { ("#[views(") ~ path ~ (")]") }
+
+// `#[reads(<plugin module path>)]` — the consume-side module holding the owned
+// types the ABI records are read back into. `<DefPrefix><Name>` pairs with
+// `<path>::<Name>`. `#[read]` on a type is what makes a reader emit for it, and
+// exists only while hand-written adapters still cover the rest: once every record
+// reads, the roots come from the slot returns and the marker goes.
+readsdef  = { ("#[reads(") ~ path ~ (")]") }
+// `#[read(<Name>)]` names the owned type when the convention would build one that
+// does not fit — `CatalogResult` would derive `Result`, shadowing the prelude.
+read_attr = { ("#[read") ~ (("(") ~ name ~ (")"))? ~ ("]") }
+
+// `#[view(<path>)]` on a struct, `#[view(<path>, fallback = <variant>)]` on an
+// enum — the host type this one pairs with when the convention does not hold.
+// `fallback` is the wrong-answer-not-UB arm, required when the enum is read inbound.
+view_attr = { ("#[view(") ~ path ~ ((",") ~ ("fallback") ~ ("=") ~ name)? ~ (")]") }
+
+// `[from(<host name>)]` renames a struct field or enum variant across the pairing;
+// `[with(<helper path>)]` hands the whole field to a hand-written host helper, and
+// `[read_with(<helper path>)]` does the same on the consume side. `[fixed(<value>)]`
+// is the publish side's synthesis: the field has no host counterpart and every
+// publish writes that value. Any order; the parser rejects a repeat, and rejects any
+// of them on a non-value payload.
+field_attrs    = _{ (from_attr | with_attr | read_with_attr | fixed_attr)+ }
+from_attr      = { ("[from(") ~ name ~ (")]") }
+with_attr      = { ("[with(") ~ path ~ (")]") }
+read_with_attr = { ("[read_with(") ~ path ~ (")]") }
+fixed_attr     = { ("[fixed(") ~ name ~ (")]") }
+
+// `const <NAME> = <value>` — a top-level cross-language constant from the single
+// `.def` source: the Rust binding emits `pub const <NAME>: u64 = <value>;` and the C
+// header emits `#define <NAME> <value>`. C uses a `#define` (not `static const`) on
+// purpose: only a macro is usable as a C array size and in `#if` version checks. The
+// verbatim name carries through unprefixed so a project can name a constant
+// (`RV_PLAYBACK_PLUGIN_API_VERSION = 2`) its consumers already reference.
+constdef = { ("const") ~ name ~ ("=") ~ name_or_num }
+
+// `mod <name>` — a top-level directive declaring this def depends
+// on the hand-written *public* header `<name>.h` in its own `#[module]` dir. The C
+// header emits `#include <flowi/<module>/<name>.h>` and the Rust binding emits
+// `use crate::<name>::*;`, so a generated vtable can name a read-payload type the
+// header defines (the render IR, `ImageDecodeResult`, glyph/vector outlines) by
+// pointer. The type is referenced by its IDL name like any other — the public
+// type's `Fl` spelling matches the emitter's prefix, and api_gen emits no body for
+// a type it has no `struct` for, so the `mod` `#include` is all that's needed. One
+// `#include`/`use` line per dependency, replacing a per-type `extern include`.
+moddef = { ("mod") ~ name }
+
+// `extern opaque <Name>` — a type the IDL references but does not
+// define. *opaque* emits a forward declaration (`typedef struct Name Name;`),
+// no `#include`, no body: pointer-only dependencies the generated header never
+// dereferences (`UiCtx`, `FlArena`, host handles). The name is the *verbatim*
+// external C type — no `Fl` prefix is applied (the dep already owns its real
+// spelling). A dependency that *does* have a public header to include is named by
+// a `mod <name>` directive instead.
+// `#[view(<path>)]` names the safe reference a consume-side wrapper takes in
+// place of the raw pointer; without it a slot carrying one is `[manual]`.
+externdef = { view_attr? ~ ("extern") ~ ("opaque") ~ name }
+
+// `callback <Name>(args) -> ret` — a named C function-pointer typedef for a
+// fn-pointer used as an argument or struct-field type (e.g. a directory-listing
+// callback). C emits `typedef ret (*FlName)(args);`; Rust emits the matching
+// nullable fn-pointer type alias (`Option<unsafe extern "C" fn(args) -> ret>`). The args
+// are named (`var`s, no implicit `self`); the return is the usual `-> ret`.
+callbackdef = { ("callback") ~ name ~ ("(") ~ varlist? ~ (")") ~ retexp? }
+
+// An `api <Domain> { fn(args) -> ret ... }` block. The functions are free
+// functions (no `self` receiver) bound to hand-written `fl_<domain>_<fn>` bodies.
+// `#[attributes(service)]` marks foundation services whose slot names are already
+// the exported C symbol names and which can opt into the Rust service wrapper.
+apidef    = { attributes* ~ ("api") ~ name ~ ("{") ~ apifnlist? ~ ("}") }
+apifnlist = { (doc_comment | apifn)* }
+
+// Per-slot markers, in any combination. `[manual]` keeps the slot's
+// C prototype, call macro and sys binding but tells the Rust façade
+// emitter to skip it (the hand-written wrapper stays). `[drop]` / `[const]` /
+// `[rename(<name>)]` drive the generated RAII opaque-handle façade: `[drop]`
+// marks the destructor (→ `impl Drop`; its `*void` arg names the handle the
+// block's other slots receive), `[const]` makes the method take `&self` instead
+// of the default `&mut self`, and `[rename(<name>)]` overrides the emitted Rust
+// method name. `[scope_begin]` / `[scope_end]` drive the generated
+// scope-guard façade: `[scope_begin]` makes the slot return a `<Domain>Scope`
+// guard whose `Drop` calls the paired `[scope_end]` slot (a thread-local
+// begin/end pair, no owned handle). `[borrowed]` lowers the slot's
+// `String` args to a *borrowed* `FlString` (pointing straight at the caller's
+// `&str`) instead of the per-frame-arena copy — for synchronous setup-time slots
+// (font/image `load`, `text_input` `set_text`) whose callee copies the bytes
+// before returning. `[retained]` is its inverse for `*const T` args: the callee
+// stores the pointer past the call, so the Rust façade copies the value into
+// wrapper-owned static storage and passes C a pointer to that copy instead of
+// the caller's borrow. `[c_only]` marks a slot whose only consumers are C:
+// the C prototype, call macro, and export entry are emitted as usual, but no
+// Rust binding or wrapper — the marker comes off when a Rust consumer arrives.
+// None of these markers alter the C / sys output.
+apifn     = { (manual_typ | drop_typ | const_typ | rename_typ | scope_begin_typ | scope_end_typ | borrowed_typ | retained_typ | transfer_typ | status_typ | thread_safe_typ | c_only_typ)* ~ name ~ ("(") ~ apiargs? ~ (")") ~ retexp? }
+apiargs   = { apiarg ~ ((",") ~ apiarg)* }
+// A `[slice(T)]` / `[slice_mut(T)]` data arg and its immediately-following
+// count arg collapse to one `&[T]` / `&mut [T]` Rust façade param (`slice_arg`,
+// tried before the bare `var`). The marked arg keeps its raw `*void` + count C / sys
+// crossing; only the façade folds the pair. A `[transfer]` data arg (`transfer_arg`,
+// service-consume wrapper) passes its owning newtype by move — the arg keeps its raw
+// pointer C / sys crossing; only the wrapper moves ownership across.
+// An `[array(T, N)]` data arg is a `*const T` the callee reads exactly N of.
+// Like `[slice]` it keeps its raw pointer C / sys crossing; only the façade
+// folds it, to `&[T; N]`. N is a literal, so it needs `name_or_num` (`vtype`
+// is identifier-only).
+apiarg    = { varargs | slice_arg | array_arg | transfer_arg | var | array }
+slice_arg = { (slice_typ | slice_mut_typ) ~ var }
+array_arg = { array_typ ~ var }
+transfer_arg = { transfer_typ ~ var }
+// The single C varargs marker (`...`), only on the one variadic slot
+// (format_frame_string). The body stays hand-written; the generator emits the
+// prototype and direct call macro.
+varargs   = { "..." }
+
+structdef = { (handle | attributes | view_attr | read_attr)* ~ ("struct") ~ name ~ ("{") ~ fieldlist? ~ ("}") }
+enumdef   = { (attributes | enum_prefix | view_attr)* ~ ("enum") ~ name ~ ("{") ~ fieldlist? ~ ("}") }
+fieldlist = { (doc_comment | field)* }
+field     = { field_attrs? ~ (union_field | var | function | enum_type) ~ fieldsep? }
+fieldsep  = _{ (",") }
+
+// A union field. With a name (`size: union { ... }`) it models a C embedded
+// *named* union member (e.g. RpLayoutSizingAxis.size, accessed `axis.size.min_max`).
+// With the name omitted (`union { ... }`) it models a C11 *anonymous* union member,
+// whose arms are accessed directly off the struct (`event.move.x`) — the shape the
+// hand-written input event structs use. Listed before `var` in `field` because
+// `var` would otherwise read `name : union` with `union` as a type name.
+union_field = { (name ~ (":"))? ~ ("union") ~ ("{") ~ varlist ~ ("}") }
+
+// `#[enumerators(<Stem>)]` overrides the C enumerator prefix stem. By default a
+// variant spells `<Prefix><EnumName>_<Variant>` (e.g. `FlKey_A`). When a hand-
+// written enum's *type* name differs from its *constant* prefix — `FlMouseEventType`
+// the type, `FlMouseEvent_Move` the constants — this names the constant stem
+// (`MouseEvent`) so the generated header stays a byte-identical drop-in. The Rust
+// binding is unaffected (variants are namespaced under the type there).
+enum_prefix = { ("#[enumerators(") ~ name ~ (")]") }
+
+attributes   = { ("#[attributes(") ~ namelist ~ (")]") }
+
+// #[handle(u32, invalid = 0xFFFFFFFF)] — declares the struct a handle: an opaque
+// integer the toolkit hands out. The first token is the underlying integer width
+// (a primitive like u32 / u64); `invalid = <value>` is the sentinel the generator
+// emits as `#define <PREFIX>_<NAME>_INVALID <value>`.
+handle       = { ("#[handle(") ~ vtype ~ (",") ~ ("invalid") ~ ("=") ~ name_or_num ~ (")]") }
+
+drop_typ     = { ("[drop]") }
+manual_typ   = { ("[manual]") }
+borrowed_typ = { ("[borrowed]") }
+retained_typ = { ("[retained]") }
+c_only_typ   = { ("[c_only]") }
+// `[transfer]` / `[transfer(free = <slot>)]` (service-consume wrapper). On an
+// `api` slot's *return* the `(free = <slot>)` form marks that the pointer's
+// ownership crosses the ABI: the wrapper returns an owning newtype whose `Drop`
+// calls the named `<slot>`. As a bare param marker (`transfer_arg`) it moves the
+// owning newtype into the callee. None of these alter the C / sys output.
+transfer_typ = { ("[transfer") ~ ("(" ~ transfer_args ~ ")")? ~ ("]") }
+transfer_args = { transfer_arg_kv ~ (("," ~ transfer_arg_kv)*) }
+transfer_arg_kv = { name ~ ("=") ~ name }
+// `[status]` (service-consume wrapper) — the slot's integer/bool status return
+// maps to `Result<T, FlError>`, with a trailing `*mut T` out-param becoming the
+// `Ok` value. C / sys output is unaffected.
+status_typ   = { ("[status]") }
+// `[thread_safe]` (service-consume wrapper) — the slot is safe to call from any
+// thread. A whole service marked thread-safe (block attribute) or every generated
+// slot marked emits `unsafe impl Send + Sync` on the wrapper. C / sys unaffected.
+thread_safe_typ = { ("[thread_safe]") }
+slice_typ     = { ("[slice(") ~ vtype ~ (")]") }
+array_typ     = { ("[array(") ~ vtype ~ (",") ~ name_or_num ~ (")]") }
+slice_mut_typ = { ("[slice_mut(") ~ vtype ~ (")]") }
+static_typ   = { ("[static]") }
+const_typ    = { ("[const]") }
+rename_typ   = { ("[rename(") ~ name ~ (")]") }
+// `[scope_begin]` drives the Rust scope-guard façade.
+scope_begin_typ = { ("[scope_begin]") }
+scope_end_typ   = { ("[scope_end]") }
+const_ptr_exp  = { ("*const ") }
+pointer_exp  = { ("*") }
+refexp       = { ("&") }
+default_val  = { ("=") ~ name_or_num? ~ string? }
+optional     = { ("?") }
+array_size   = { (";") ~ name_or_num }
+array        = { ("[") ~ (const_ptr_exp | refexp | pointer_exp)? ~ vtype ~ array_size? ~ ("]") ~ optional? }
+retexp       = { ("->") ~ (const_ptr_exp | refexp | pointer_exp)? ~ (vtype | array) ~ optional? }
+var          = { name ~ (":") ~ (const_ptr_exp | refexp | pointer_exp)? ~ (vtype | array) ~ default_val? }
+varlist      = { (var | array) ~ ((",") ~ (var | array))* }
+enum_assign  = { ("=") ~ or_namelist ~ (",") }
+enum_type    = { name ~ enum_assign? }
+namelist     = { name ~ ((",") ~ name)* }
+or_namelist  = { string_to_end ~ (("|") ~ string_to_end)* }
+function     = { (manual_typ | static_typ | drop_typ)*? ~ name ~ ("(") ~ varlist? ~ (")") ~ retexp? }
+
+name = @{
+	(('a'..'z') | ('A'..'Z') | ("_")) ~ (('a'..'z') | ('A'..'Z') | ("_") | ('0'..'9'))*
+}
+
+// A `::`-separated Rust path (`crate::demoscene::data`). Atomic: no whitespace
+// inside, and the whole path is the token.
+path = @{ name ~ (("::") ~ name)* }
+
+string_to_end = @{
+    (!(",") ~ !("|") ~ ANY)*
+}
+
+name_or_num = @{
+	(('a'..'z') | ('A'..'Z') | ("|") | ("<") | ("_") | ('0'..'9'))*
+}
+
+string = @{
+	( "\"" ~ name_or_num ~ "\"")*
+}
+
+vtype = @{
+	(('a'..'z') | ('A'..'Z') | ("_")) ~ (('a'..'z') | ('A'..'Z') | ("_") | ('0'..'9'))*
+}
+
+COMMENT = _{
+	("//") ~ !("/") ~ (!(("\r") | ("\n")) ~ ANY)* ~ (("\n") | ("\r\n") | ("\r") | EOI)
+}
+
+doc_comment = @{
+	((" ")*) ~ ("///") ~ (!NEWLINE ~ ANY)*
+}
+
+WHITESPACE = _{ (" ") | ("\t") | ("\u{000C}") | ("\r") | ("\n") }

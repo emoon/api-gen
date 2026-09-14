@@ -1,0 +1,22 @@
+# api_gen — an IDL → {C headers, Rust FFI bindings, export lists} generator.
+#
+# Consumers depend on this crate from a dev-only codegen crate kept in its own
+# workspace, so api_gen's dependency tree never reaches the Cargo.lock of anything
+# they ship. Codegen is manual — never invoked at build time — so a consumer's
+# C-only build paths stay ignorant of this crate entirely.
+[package]
+name = "api_gen"
+version = "0.1.0"
+license = "MIT"
+repository = "https://github.com/emoon/api-gen"
+description = "IDL-driven generator for C headers, Rust FFI bindings and linker export lists"
+edition = "2021"
+publish = false
+
+[dependencies]
+pest = "2"
+pest_derive = "2"
+heck = "0.4"
+
+# Independent workspace root, so this crate's lock is its own.
+[workspace]
