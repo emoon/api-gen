@@ -73,7 +73,7 @@ pub fn write_mod_file(
 
 /// Every struct a slot returns whose whole record lowers, each after everything it
 /// nests: what generate emits, and what a round-trip test can pair against.
-pub fn publishable(api_defs: &[ApiDef], model: &PairedModel) -> Vec<String> {
+pub fn publishable(api_defs: &[&ApiDef], model: &PairedModel) -> Vec<String> {
     emission_order(model, &slot_types(api_defs, model, true))
 }
 
@@ -560,7 +560,7 @@ mod tests {
 
         generate(
             dir.to_str().unwrap(),
-            &publishable(&api_defs, &model),
+            &publishable(&crate::pairing::as_refs(&api_defs), &model),
             &model,
             &MarshalPaths {
                 abi_crate: "replay_plugin",

@@ -113,8 +113,18 @@ fn utf8(path: &Path) -> Result<&str, Error> {
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub naming: Naming,
-    /// Input defs: `<api_dir>/*.def`.
+    /// Input defs: `<api_dir>/*.def`. These are the defs this run owns and emits.
     pub api_dir: PathBuf,
+    /// Extra def directories parsed for their types but never emitted: the IDL of a
+    /// library this project builds against. A def in `api_dir` may embed a type
+    /// declared here by value, and the layout pass needs its size to resolve the
+    /// embedder - but the header, binding and exported symbol for it belong to
+    /// whoever owns that library, and emitting a second copy here would be the two-
+    /// copies problem this exists to avoid.
+    ///
+    /// Cross-module C includes still point at the referenced type's own header, so
+    /// the two projects must agree on `c_include_prefix`.
+    pub reference_dirs: Vec<PathBuf>,
     /// Raw Rust FFI output dir (Flowi: rust/flowi_sys/src/generated).
     pub rust_dir: Option<PathBuf>,
     /// C public-header root; per-module subdir created on demand.
@@ -207,6 +217,19 @@ fn gen_script(cfg: &Config) -> &str {
         .unwrap_or("the project's binding script")
 }
 
+/// Every `*.def` under `dir`, sorted, so a run's parse order never depends on the
+/// filesystem's.
+fn defs_in(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(io("reading", dir))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "def").unwrap_or(false))
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
 pub fn generate(cfg: &Config) -> Result<Summary, Error> {
     let api_dir = &cfg.api_dir;
     if let Some(c_include_root) = &cfg.c_include_root {
@@ -222,14 +245,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
         std::fs::create_dir_all(wrapper_dir).map_err(io("creating", wrapper_dir))?;
     }
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(api_dir)
-        .map_err(io("reading", api_dir))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "def").unwrap_or(false))
-        .collect();
-    files.sort();
-
+    let files = defs_in(api_dir)?;
     let mut api_defs: Vec<ApiDef> = Vec::with_capacity(files.len());
     for path in &files {
         let mut api_def = ApiDef::default();
@@ -237,14 +253,43 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
         api_defs.push(api_def);
     }
 
+    // Reference defs join the type graph so the passes below see every type, then drop
+    // out of every emission loop: `owned` is the set this run is allowed to write for.
+    // A reference def that repeats a name from api_dir is a real conflict - two projects
+    // both claiming one type - so it is rejected rather than silently shadowed.
+    let owned: std::collections::HashSet<String> =
+        api_defs.iter().map(|d| d.base_filename.clone()).collect();
+    for dir in &cfg.reference_dirs {
+        for path in &defs_in(dir)? {
+            let mut api_def = ApiDef::default();
+            ApiParser::parse_file(path, &mut api_def);
+            if owned.contains(&api_def.base_filename) {
+                return Err(Error::Config(format!(
+                    "reference def {} also exists in api_dir {}; one project owns a def, \
+                     not both",
+                    path.display(),
+                    api_dir.display()
+                )));
+            }
+            api_defs.push(api_def);
+        }
+    }
+
     ApiParser::second_pass(&mut api_defs, &cfg.naming);
     api_defs.sort_by(|a, b| a.filename.cmp(&b.filename));
+
+    // Everything downstream that EMITS walks this; everything that RESOLVES walks
+    // api_defs.
+    let emitted: Vec<&ApiDef> = api_defs
+        .iter()
+        .filter(|d| owned.contains(&d.base_filename))
+        .collect();
 
     let paired = pairing::resolve(&api_defs).map_err(|e| Error::Idl(e.to_string()))?;
     if let Some(marshal_dir) = &cfg.marshal_dir {
         let dir = utf8(marshal_dir)?;
         std::fs::create_dir_all(marshal_dir).map_err(io("creating", marshal_dir))?;
-        let publishable = marshal_gen::publishable(&api_defs, &paired);
+        let publishable = marshal_gen::publishable(&emitted, &paired);
         let abi_crate = cfg
             .marshal_abi_crate
             .as_deref()
@@ -261,7 +306,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
         )
         .map_err(io("writing marshalling into", marshal_dir))?;
 
-        let inbound = inbound_gen::inbound(&api_defs, &paired);
+        let inbound = inbound_gen::inbound(&emitted, &paired);
         modules.extend(
             inbound_gen::generate(
                 dir,
@@ -348,7 +393,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
     if let Some(rust_dir) = &cfg.rust_dir {
         RustGen::generate_mod_file(
             utf8(rust_dir)?,
-            &api_defs,
+            &emitted,
             cfg.rust_allow_dead_code,
             &read_modules,
             cfg.read_test_feature.as_deref(),
@@ -369,7 +414,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
 
     let mut facade_modules: Vec<String> = Vec::new();
     let mut service_wrapper_modules: Vec<String> = Vec::new();
-    for api_def in &api_defs {
+    for api_def in &emitted {
         if let Some(rust_dir) = &cfg.rust_dir {
             RustGen::generate(utf8(rust_dir)?, api_def, &registry, gen_script(cfg)).map_err(io(
                 &format!("writing Rust for {} into", api_def.base_filename),
@@ -455,14 +500,14 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
             stem,
             cfg.export_additive,
             cfg.export_dynlist,
-            &api_defs,
+            &emitted,
             gen_script(cfg),
         )
         .map_err(io("writing the export list into", export_dir))?;
     }
 
     Ok(Summary {
-        modules: api_defs.len(),
+        modules: emitted.len(),
         exported_symbols,
     })
 }
@@ -477,7 +522,7 @@ fn write_export_list(
     export_stem: &str,
     additive: bool,
     dynlist: bool,
-    api_defs: &[ApiDef],
+    api_defs: &[&ApiDef],
     script: &str,
 ) -> std::io::Result<usize> {
     std::fs::create_dir_all(export_dir)?;
@@ -555,6 +600,7 @@ mod tests {
         let summary = generate(&Config {
             naming: crate::naming::FL,
             api_dir,
+            reference_dirs: Vec::new(),
             rust_dir: None,
             c_include_root: None,
             facade_dir: None,
@@ -593,6 +639,128 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A library's defs join the type graph without being emitted: the embedder's own
+    /// header and binding resolve the borrowed type's layout, but nothing is written for
+    /// it and its symbols stay off this project's export list.
+    #[test]
+    fn reference_defs_resolve_layout_without_being_emitted() {
+        let root = std::env::temp_dir().join(format!(
+            "api_gen_reference_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let api_dir = root.join("api");
+        let ref_dir = root.join("vendor-api");
+        let rust_dir = root.join("rust");
+        let include_root = root.join("include");
+        let export_dir = root.join("exports");
+        std::fs::create_dir_all(&api_dir).expect("create api dir");
+        std::fs::create_dir_all(&ref_dir).expect("create reference dir");
+
+        // The library owns Vec2; the embedder embeds it by value, so its own layout is
+        // unresolvable unless the reference def is parsed.
+        std::fs::write(
+            ref_dir.join("math_data.def"),
+            "struct Vec2 { x: f32, y: f32 }\napi Math { math_len(v: Vec2) -> f32 }",
+        )
+        .expect("write reference fixture");
+        std::fs::write(
+            api_dir.join("widget.def"),
+            "struct WidgetBox { origin: Vec2, size: Vec2 }\n\
+             api Widget { widget_emit(b: WidgetBox) -> u32 }",
+        )
+        .expect("write owned fixture");
+
+        let summary = generate(&Config {
+            naming: crate::naming::FL,
+            api_dir,
+            reference_dirs: vec![ref_dir],
+            rust_dir: Some(rust_dir.clone()),
+            c_include_root: Some(include_root.clone()),
+            export_dir: Some(export_dir.clone()),
+            c_layout_asserts: true,
+            ..Default::default()
+        })
+        .expect("generation with a reference def");
+
+        // Only the owned def counts as a module, and only its symbol is exported.
+        assert_eq!(summary.modules, 1, "the reference def is not a module here");
+        assert_eq!(
+            summary.exported_symbols, 1,
+            "math_len belongs to the library"
+        );
+
+        assert!(rust_dir.join("widget.rs").is_file());
+        assert!(
+            !rust_dir.join("math_data.rs").exists(),
+            "a reference def must not be emitted"
+        );
+        assert!(!include_root.join("math_data/math_data.h").exists());
+
+        let mod_rs = std::fs::read_to_string(rust_dir.join("mod.rs")).expect("read mod.rs");
+        assert!(mod_rs.contains("widget"));
+        assert!(
+            !mod_rs.contains("math_data"),
+            "the index must not declare a module that was never written"
+        );
+
+        // The borrowed type resolved: WidgetBox is two Vec2s, so 16 bytes.
+        let widget_rs = std::fs::read_to_string(rust_dir.join("widget.rs")).expect("read widget");
+        assert!(
+            widget_rs.contains("size_of::<WidgetBox>() == 16"),
+            "the embedder's layout must resolve through the reference def:\n{widget_rs}"
+        );
+
+        let version = std::fs::read_to_string(export_dir.join("flowi.version")).expect("exports");
+        assert!(version.contains("widget_emit;"));
+        assert!(
+            !version.contains("math_len;"),
+            "a reference def's symbols are exported by whoever owns it"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Two projects cannot both own one def. Shadowing silently would make which copy
+    /// wins depend on directory order.
+    #[test]
+    fn a_reference_def_may_not_shadow_an_owned_one() {
+        let root = std::env::temp_dir().join(format!(
+            "api_gen_reference_clash_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let api_dir = root.join("api");
+        let ref_dir = root.join("vendor-api");
+        std::fs::create_dir_all(&api_dir).expect("create api dir");
+        std::fs::create_dir_all(&ref_dir).expect("create reference dir");
+        std::fs::write(
+            api_dir.join("math_data.def"),
+            "struct Vec2 { x: f32, y: f32 }",
+        )
+        .expect("write owned fixture");
+        std::fs::write(
+            ref_dir.join("math_data.def"),
+            "struct Vec2 { x: f32, y: f32 }",
+        )
+        .expect("write reference fixture");
+
+        let err = generate(&Config {
+            naming: crate::naming::FL,
+            api_dir,
+            reference_dirs: vec![ref_dir],
+            rust_dir: Some(root.join("rust")),
+            ..Default::default()
+        })
+        .expect_err("a def owned on both sides must be rejected");
+        assert!(
+            matches!(err, Error::Config(ref m) if m.contains("math_data.def")),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn export_list_includes_variadic_api_functions() {
         let mut api_def = ApiDef::default();
@@ -612,7 +780,7 @@ mod tests {
             "flowi",
             false,
             false,
-            &api_defs,
+            &crate::pairing::as_refs(&api_defs),
             "scripts/gen.sh",
         )
         .expect("write export list");
@@ -645,7 +813,7 @@ mod tests {
             "flowi",
             false,
             false,
-            &api_defs,
+            &crate::pairing::as_refs(&api_defs),
             "scripts/gen.sh",
         )
         .expect("write export list");
@@ -679,7 +847,7 @@ mod tests {
             "flowi",
             true,
             false,
-            &api_defs,
+            &crate::pairing::as_refs(&api_defs),
             "scripts/gen.sh",
         )
         .expect("write export list");
@@ -693,7 +861,7 @@ mod tests {
             "flowi",
             true,
             true,
-            &api_defs,
+            &crate::pairing::as_refs(&api_defs),
             "scripts/gen.sh",
         )
         .expect("write export list");

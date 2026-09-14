@@ -8,6 +8,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut naming = None;
     let mut api_dir = None;
+    let mut reference_dirs = Vec::new();
     let mut rust_dir = None;
     let mut c_include_root = None;
     let mut facade_dir = None;
@@ -47,6 +48,7 @@ fn main() {
                 naming = Some(Naming::new(t, f));
             }
             "--api-dir" => api_dir = Some(PathBuf::from(val())),
+            "--reference-dir" => reference_dirs.push(PathBuf::from(val())),
             "--rust-dir" => rust_dir = Some(PathBuf::from(val())),
             "--c-include-root" => c_include_root = Some(PathBuf::from(val())),
             "--facade-dir" => facade_dir = Some(PathBuf::from(val())),
@@ -89,6 +91,7 @@ fn main() {
     let summary = match generate(&Config {
         naming,
         api_dir: api_dir.expect("--api-dir required"),
+        reference_dirs,
         rust_dir,
         c_include_root,
         facade_dir,

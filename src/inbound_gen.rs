@@ -31,7 +31,7 @@ pub struct InboundPaths<'a> {
 
 /// Every record a slot takes as a parameter, each after what it nests. A `[with]`
 /// field is the helper's, so what it nests is never reached.
-pub fn inbound(api_defs: &[ApiDef], model: &PairedModel) -> Vec<String> {
+pub fn inbound(api_defs: &[&ApiDef], model: &PairedModel) -> Vec<String> {
     let roots = slot_types(api_defs, model, false);
     nesting_order(model, roots.iter().map(String::as_str), |f| {
         f.with.is_none()
@@ -451,7 +451,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("temp dir");
         let modules = generate(
             dir.to_str().expect("utf8"),
-            &inbound(&api_defs, &model),
+            &inbound(&crate::pairing::as_refs(&api_defs), &model),
             &model,
             &InboundPaths {
                 abi_crate: "replay_plugin",
@@ -473,7 +473,7 @@ mod tests {
         let model = crate::pairing::resolve(&api_defs).expect("pairs");
 
         assert_eq!(
-            inbound(&api_defs, &model),
+            inbound(&crate::pairing::as_refs(&api_defs), &model),
             ["DemozooFilter", "DemozooQuery"]
         );
     }

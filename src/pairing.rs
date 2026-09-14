@@ -87,9 +87,15 @@ pub struct PairedEnum {
     pub variants: Vec<PairedVariant>,
 }
 
+/// Borrow an owned def list as the `&[&ApiDef]` the emission-side entry points take.
+/// `generate` builds its own filtered view; this is for callers holding the whole set.
+pub fn as_refs(api_defs: &[ApiDef]) -> Vec<&ApiDef> {
+    api_defs.iter().collect()
+}
+
 /// The paired records a slot names by value: from its return when publish, from
 /// its parameters otherwise.
-pub fn slot_types(api_defs: &[ApiDef], model: &PairedModel, publish: bool) -> BTreeSet<String> {
+pub fn slot_types(api_defs: &[&ApiDef], model: &PairedModel, publish: bool) -> BTreeSet<String> {
     let mut roots = BTreeSet::new();
     for api_def in api_defs {
         for api in &api_def.apis {

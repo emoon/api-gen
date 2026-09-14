@@ -45,6 +45,29 @@ files is the drift gate — it never mutates the tree, and it names the file tha
 The `api_gen` binary wraps the same `Config` in an argv parser, for callers that would
 rather shell out.
 
+## Building against another project's IDL
+
+A project whose defs embed types declared by a library it builds against names that
+library's def directory in `reference_dirs`:
+
+```rust
+api_gen::generate(&Config {
+    api_dir: repo.join("api"),
+    reference_dirs: vec![core_checkout.join("api")],
+    ..Default::default()
+})?;
+```
+
+Reference defs are parsed into the type graph — so the layout pass can size a struct that
+embeds one of their types by value — and are then excluded from everything that emits. No
+header, binding or façade is written for them, they do not appear in the generated `mod.rs`,
+and their symbols stay off this project's export list, because the library that owns them
+exports them itself. A def present in both directories is an error rather than a silent
+shadow: one project owns a def, not both.
+
+Both projects must agree on `c_include_prefix`, since a generated header's cross-include
+points at the referenced type's own header.
+
 ## Output is deterministic
 
 Regenerating an unchanged tree reproduces byte-identical output, which is what makes the

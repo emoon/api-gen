@@ -2455,7 +2455,7 @@ impl RustGen {
     /// without an FFI call can reach it from another crate.
     pub fn generate_mod_file(
         rust_dir: &str,
-        api_defs: &[ApiDef],
+        api_defs: &[&ApiDef],
         allow_dead_code: bool,
         read_modules: &[String],
         read_feature: Option<&str>,
@@ -6983,7 +6983,7 @@ mod tests {
         ApiParser::parse_string("#[module(demozoo)]", "demozoo.def", &mut api_def);
         RustGen::generate_mod_file(
             dir.to_str().unwrap(),
-            &[api_def],
+            &[&api_def],
             false,
             read_modules,
             feature,

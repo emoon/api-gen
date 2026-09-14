@@ -999,7 +999,7 @@ mod tests {
         let modules = generate(
             dir.to_str().unwrap(),
             &paired,
-            &crate::marshal_gen::publishable(&api_defs, &paired),
+            &crate::marshal_gen::publishable(&crate::pairing::as_refs(&api_defs), &paired),
             &TestPaths {
                 read_path: "replay_plugin::generated",
                 arena: "flowi::Arena",
@@ -1256,7 +1256,7 @@ mod tests {
         let modules = generate_inbound(
             dir.to_str().unwrap(),
             &paired,
-            &crate::inbound_gen::inbound(&api_defs, &paired),
+            &crate::inbound_gen::inbound(&crate::pairing::as_refs(&api_defs), &paired),
             &InboundTestPaths {
                 abi_crate: "replay_plugin",
                 uses: &["flowi::RawStr".to_owned()],
@@ -1366,7 +1366,7 @@ mod tests {
             }\n\
             api Catalog { rp_catalog_slot_update(q: *const CatalogQuery) -> u32 }";
         let (api_defs, paired) = model_named(src, "catalog.def");
-        let inbound = crate::inbound_gen::inbound(&api_defs, &paired);
+        let inbound = crate::inbound_gen::inbound(&crate::pairing::as_refs(&api_defs), &paired);
 
         assert_eq!(inbound, ["CatalogTerm", "CatalogQuery"], "both are read");
         assert!(
