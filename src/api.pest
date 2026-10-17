@@ -39,11 +39,20 @@ view_attr = { ("#[view(") ~ path ~ ((",") ~ ("fallback") ~ ("=") ~ name)? ~ (")]
 // is the publish side's synthesis: the field has no host counterpart and every
 // publish writes that value. Any order; the parser rejects a repeat, and rejects any
 // of them on a non-value payload.
-field_attrs    = _{ (from_attr | with_attr | read_with_attr | fixed_attr)+ }
+//
+// `[label("<text>")]` and `[reserved]` annotate enum variants only: a label is the
+// variant's canonical display text, given to every variant or none, and emits the
+// name/label lookups beside the enum; `[reserved]` emits an is-reserved predicate
+// true for the variants carrying it.
+field_attrs    = _{ (from_attr | with_attr | read_with_attr | fixed_attr | label_attr | reserved_attr)+ }
 from_attr      = { ("[from(") ~ name ~ (")]") }
 with_attr      = { ("[with(") ~ path ~ (")]") }
 read_with_attr = { ("[read_with(") ~ path ~ (")]") }
 fixed_attr     = { ("[fixed(") ~ name ~ (")]") }
+label_attr     = { ("[label(\"") ~ label_text ~ ("\")]") }
+// Printable ASCII bar `"` and `\`, so the text is a valid literal in C and Rust as is.
+label_text     = @{ (!("\"" | "\\") ~ ' '..'~')+ }
+reserved_attr  = { ("[reserved]") }
 
 // `const <NAME> = <value>` — a top-level cross-language constant from the single
 // `.def` source: the Rust binding emits `pub const <NAME>: u64 = <value>;` and the C

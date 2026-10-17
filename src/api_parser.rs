@@ -116,6 +116,8 @@ struct FieldAttrs {
     with_helper: Option<String>,
     read_with: Option<String>,
     fixed: Option<String>,
+    label: Option<String>,
+    reserved: bool,
 }
 
 impl FieldAttrs {
@@ -123,6 +125,15 @@ impl FieldAttrs {
     /// last of them.
     fn absorb(&mut self, rule: Pair<Rule>) {
         let text = rule.as_str().to_owned();
+        if rule.as_rule() == Rule::reserved_attr {
+            assert!(
+                !self.reserved,
+                "api_gen: one `{}` per field, and this one repeats it",
+                text
+            );
+            self.reserved = true;
+            return;
+        }
         let (slot, value) = match rule.as_rule() {
             Rule::from_attr => (
                 &mut self.from_host,
@@ -139,6 +150,10 @@ impl FieldAttrs {
             Rule::fixed_attr => (
                 &mut self.fixed,
                 ApiParser::first_child_str(rule, Rule::name),
+            ),
+            Rule::label_attr => (
+                &mut self.label,
+                ApiParser::first_child_str(rule, Rule::label_text),
             ),
             other => unreachable!("not a field annotation: {:?}", other),
         };
@@ -472,6 +487,10 @@ pub struct EnumEntry {
     pub value: EnumValue,
     /// `[from(<host variant>)]`: the paired host variant is named this.
     pub from_host: Option<String>,
+    /// `[label("<text>")]`: the variant's canonical display text.
+    pub label: Option<String>,
+    /// `[reserved]`: the variant is reserved to the side that owns the enum.
+    pub reserved: bool,
 }
 
 /// Whether an enum is a plain sequential enum or a bitflags set.
@@ -772,12 +791,36 @@ impl ApiParser {
                     enum_def.is_packed = attributes.iter().any(|a| a == "packed");
                     enum_def.is_error_enum = attributes.iter().any(|a| a == "error_enum");
                     enum_def.is_serde = attributes.iter().any(|a| a == "serde");
+                    Self::validate_variant_attrs(&enum_def);
                     api_def.enums.push(enum_def);
                 }
 
                 _ => (),
             }
         }
+    }
+
+    /// A label set is all-or-nothing, so the lookups emitted from it are total;
+    /// and a bitflags variant is a bit, not a value with a display text.
+    fn validate_variant_attrs(enum_def: &Enum) {
+        let labelled = enum_def
+            .entries
+            .iter()
+            .filter(|e| e.label.is_some())
+            .count();
+        assert!(
+            labelled == 0 || labelled == enum_def.entries.len(),
+            "api_gen: enum `{}` labels {} of its {} variants; label every variant or none",
+            enum_def.name,
+            labelled,
+            enum_def.entries.len()
+        );
+        let annotated = labelled > 0 || enum_def.entries.iter().any(|e| e.reserved);
+        assert!(
+            !(annotated && enum_def.enum_type == EnumType::Bitflags),
+            "api_gen: bitflags enum `{}` cannot carry `[label(...)]` or `[reserved]`",
+            enum_def.name
+        );
     }
 
     fn determine_enum_type(attributes: &[String]) -> EnumType {
@@ -846,6 +889,7 @@ impl ApiParser {
     /// value field with a host one. On a union or a function-pointer field they
     /// would silently mean nothing, so they are refused.
     fn reject_pairing_attrs(attrs: &FieldAttrs, name: &str) {
+        Self::reject_variant_attrs(attrs, name);
         if attrs.from_host.is_some()
             || attrs.with_helper.is_some()
             || attrs.read_with.is_some()
@@ -853,6 +897,18 @@ impl ApiParser {
         {
             panic!(
                 "api_gen: pairing annotations apply to value fields only: drop them from `{}`",
+                name
+            );
+        }
+    }
+
+    /// `[label(...)]` / `[reserved]` describe an enum variant; on a struct field
+    /// nothing would read them, so they are refused.
+    fn reject_variant_attrs(attrs: &FieldAttrs, name: &str) {
+        if attrs.label.is_some() || attrs.reserved {
+            panic!(
+                "api_gen: `[label(...)]` and `[reserved]` apply to enum variants only: drop them \
+                 from `{}`",
                 name
             );
         }
@@ -906,7 +962,9 @@ impl ApiParser {
                             Rule::from_attr
                             | Rule::with_attr
                             | Rule::read_with_attr
-                            | Rule::fixed_attr => attrs.absorb(field),
+                            | Rule::fixed_attr
+                            | Rule::label_attr
+                            | Rule::reserved_attr => attrs.absorb(field),
                             Rule::union_field => {
                                 let var = Self::get_union_field(field, &doc_comments);
                                 Self::reject_pairing_attrs(&attrs, &var.name);
@@ -916,6 +974,7 @@ impl ApiParser {
                             }
                             Rule::var => {
                                 let mut var = Self::get_variable(field, &doc_comments);
+                                Self::reject_variant_attrs(&attrs, &var.name);
                                 var.from_host = attrs.from_host.take();
                                 var.with_helper = attrs.with_helper.take();
                                 var.read_with = attrs.read_with.take();
@@ -1340,7 +1399,9 @@ impl ApiParser {
                             Rule::from_attr
                             | Rule::with_attr
                             | Rule::read_with_attr
-                            | Rule::fixed_attr => attrs.absorb(field),
+                            | Rule::fixed_attr
+                            | Rule::label_attr
+                            | Rule::reserved_attr => attrs.absorb(field),
                             Rule::enum_type => {
                                 let mut item =
                                     Self::get_enum(&doc_comments, &mut current_value, field);
@@ -1365,6 +1426,8 @@ impl ApiParser {
                                     );
                                 }
                                 item.from_host = attrs.from_host.take();
+                                item.label = attrs.label.take();
+                                item.reserved = attrs.reserved;
                                 entries.push(item);
                                 doc_comments.clear();
                             }
@@ -1417,6 +1480,8 @@ impl ApiParser {
             name,
             value,
             from_host: None,
+            label: None,
+            reserved: false,
         }
     }
 
@@ -1919,6 +1984,24 @@ impl Enum {
     /// typedef enum. Every enum the IDL defines is real.
     pub fn is_real_type(&self) -> bool {
         true
+    }
+
+    /// Each variant paired with its `[label(...)]`, or None when the enum is not
+    /// labelled. The parser admits only all-or-none label sets.
+    pub fn labelled_entries(&self) -> Option<Vec<(&EnumEntry, &str)>> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        self.entries
+            .iter()
+            .map(|e| e.label.as_deref().map(|label| (e, label)))
+            .collect()
+    }
+
+    /// The `[reserved]` variants, or None when the enum reserves none.
+    pub fn reserved_entries(&self) -> Option<Vec<&EnumEntry>> {
+        let reserved: Vec<&EnumEntry> = self.entries.iter().filter(|e| e.reserved).collect();
+        (!reserved.is_empty()).then_some(reserved)
     }
 
     /// The literal a generator prints for this entry's `= <value>`, or None
@@ -3231,6 +3314,58 @@ mod tests {
              extern opaque FlArena",
             "demozoo.def",
             &mut api_def,
+        );
+    }
+
+    #[test]
+    fn label_and_reserved_annotate_their_enum_variants() {
+        let def = resolved(
+            "enum Act {\n    [label(\"Shoulder L\")] ShoulderL = 0,\n    \
+             [reserved] [label(\"Menu\")] Menu = 1,\n}",
+            "act.def",
+        );
+        let edef = &def.enums[0];
+        let labels: Vec<(&str, &str)> = edef
+            .labelled_entries()
+            .expect("labelled")
+            .into_iter()
+            .map(|(e, label)| (e.name.as_str(), label))
+            .collect();
+        assert_eq!(labels, [("ShoulderL", "Shoulder L"), ("Menu", "Menu")]);
+        let reserved: Vec<&str> = edef
+            .reserved_entries()
+            .expect("reserved")
+            .into_iter()
+            .map(|e| e.name.as_str())
+            .collect();
+        assert_eq!(reserved, ["Menu"]);
+    }
+
+    #[test]
+    fn plain_enum_has_no_labels_and_reserves_nothing() {
+        let def = resolved("enum Plain { A = 0, B = 1, }", "plain.def");
+        assert!(def.enums[0].labelled_entries().is_none());
+        assert!(def.enums[0].reserved_entries().is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "labels 1 of its 2 variants")]
+    fn enum_labelling_only_some_variants_is_refused() {
+        resolved("enum Act { [label(\"Up\")] Up = 0, Down = 1, }", "act.def");
+    }
+
+    #[test]
+    #[should_panic(expected = "apply to enum variants only")]
+    fn label_on_a_struct_field_is_refused() {
+        resolved("struct S { [label(\"X\")] x: u32, }", "s.def");
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot carry")]
+    fn reserved_on_a_bitflags_variant_is_refused() {
+        resolved(
+            "#[attributes(bitflags)]\nenum F { [reserved] A = 1, B = 2, }",
+            "f.def",
         );
     }
 }

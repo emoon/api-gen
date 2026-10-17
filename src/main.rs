@@ -17,6 +17,7 @@ fn main() {
     let mut c_include_prefix = None;
     let mut c_extern_c = false;
     let mut c_layout_asserts = false;
+    let mut c_spdx_license = None;
     let mut export_dir = None;
     let mut c_string_type = None;
     let mut c_string_include = None;
@@ -57,6 +58,7 @@ fn main() {
             "--c-include-prefix" => c_include_prefix = Some(val()),
             "--c-extern-c" => c_extern_c = true,
             "--c-layout-asserts" => c_layout_asserts = true,
+            "--c-spdx-license" => c_spdx_license = Some(val()),
             "--export-dir" => export_dir = Some(PathBuf::from(val())),
             "--c-string-type" => c_string_type = Some(val()),
             "--c-string-include" => c_string_include = Some(val()),
@@ -100,6 +102,7 @@ fn main() {
         c_include_prefix,
         c_extern_c,
         c_layout_asserts,
+        c_spdx_license,
         export_dir,
         export_stem,
         export_additive,

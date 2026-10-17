@@ -165,6 +165,9 @@ pub struct Config {
     /// generated C header, the C counterpart of the const _ block the Rust
     /// binding always carries. Opt-in: it changes previously emitted headers.
     pub c_layout_asserts: bool,
+    /// SPDX licence identifier written under the banner of each generated C
+    /// header (`// SPDX-License-Identifier: MIT`). None writes no licence line.
+    pub c_spdx_license: Option<String>,
     /// Also emit the export set as a GNU linker dynamic list
     /// (`<stem>.dynlist`, -Wl,--dynamic-list= format), which an executable
     /// exporting to dlopen'd plugins uses instead of a version script.
@@ -463,6 +466,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
                     cfg.c_extern_c,
                     cfg.c_layout_asserts.then_some(&registry),
                     gen_script(cfg),
+                    cfg.c_spdx_license.as_deref(),
                 )
                 .map_err(io(
                     &format!("writing the C header for {} into", api_def.base_filename),
@@ -609,6 +613,7 @@ mod tests {
             c_include_prefix: None,
             c_extern_c: false,
             c_layout_asserts: false,
+            c_spdx_license: None,
             export_dir: None,
             export_stem: None,
             export_additive: false,

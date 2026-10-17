@@ -800,6 +800,84 @@ impl RustGen {
         Ok(())
     }
 
+    /// Emit the inherent lookups a variant annotation asks for: `[label(...)]` on
+    /// every variant gives `ALL`, `name`/`label` and their `from_*` inverses;
+    /// any `[reserved]` variant gives `is_reserved`. Nothing for a plain enum.
+    fn generate_enum_lookups<W: Write>(f: &mut W, edef: &Enum) -> io::Result<()> {
+        let name = &edef.name;
+        if let Some(labelled) = edef.labelled_entries() {
+            writeln!(f, "impl {} {{", name)?;
+            writeln!(f, "    /// Every variant, in declaration order.")?;
+            writeln!(f, "    pub const ALL: [{}; {}] = [", name, labelled.len())?;
+            for (entry, _) in &labelled {
+                writeln!(f, "        {}::{},", name, entry.name)?;
+            }
+            writeln!(f, "    ];")?;
+            writeln!(f)?;
+            writeln!(f, "    /// The variant's name as the IDL spells it.")?;
+            writeln!(f, "    #[must_use]")?;
+            writeln!(f, "    pub const fn name(self) -> &'static str {{")?;
+            writeln!(f, "        match self {{")?;
+            for (entry, _) in &labelled {
+                writeln!(
+                    f,
+                    "            {}::{} => \"{}\",",
+                    name, entry.name, entry.name
+                )?;
+            }
+            writeln!(f, "        }}")?;
+            writeln!(f, "    }}")?;
+            writeln!(f)?;
+            writeln!(f, "    /// The variant's canonical display label.")?;
+            writeln!(f, "    #[must_use]")?;
+            writeln!(f, "    pub const fn label(self) -> &'static str {{")?;
+            writeln!(f, "        match self {{")?;
+            for (entry, label) in &labelled {
+                writeln!(f, "            {}::{} => \"{}\",", name, entry.name, label)?;
+            }
+            writeln!(f, "        }}")?;
+            writeln!(f, "    }}")?;
+            writeln!(f)?;
+            writeln!(f, "    /// The variant whose [`Self::name`] is `name`.")?;
+            writeln!(f, "    #[must_use]")?;
+            writeln!(f, "    pub fn from_name(name: &str) -> Option<Self> {{")?;
+            writeln!(
+                f,
+                "        Self::ALL.into_iter().find(|v| v.name() == name)"
+            )?;
+            writeln!(f, "    }}")?;
+            writeln!(f)?;
+            writeln!(f, "    /// The variant whose [`Self::label`] is `label`.")?;
+            writeln!(f, "    #[must_use]")?;
+            writeln!(f, "    pub fn from_label(label: &str) -> Option<Self> {{")?;
+            writeln!(
+                f,
+                "        Self::ALL.into_iter().find(|v| v.label() == label)"
+            )?;
+            writeln!(f, "    }}")?;
+            writeln!(f, "}}")?;
+            writeln!(f)?;
+        }
+        if let Some(reserved) = edef.reserved_entries() {
+            let pattern: Vec<String> = reserved
+                .iter()
+                .map(|entry| format!("{}::{}", name, entry.name))
+                .collect();
+            writeln!(f, "impl {} {{", name)?;
+            writeln!(
+                f,
+                "    /// Whether this variant is reserved to the side that owns the enum."
+            )?;
+            writeln!(f, "    #[must_use]")?;
+            writeln!(f, "    pub const fn is_reserved(self) -> bool {{")?;
+            writeln!(f, "        matches!(self, {})", pattern.join(" | "))?;
+            writeln!(f, "    }}")?;
+            writeln!(f, "}}")?;
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+
     /// Emit the shared FlError companion of an `#[attributes(error_enum)]`
     /// status enum: one variant per non-success code (success = the code-0
     /// entry, which becomes the Ok arm of the decode) plus an Unknown(i32)
@@ -1156,6 +1234,7 @@ impl RustGen {
                 Self::generate_bitflags(&mut f, enum_def)?;
             } else {
                 Self::generate_data_enum(&mut f, enum_def)?;
+                Self::generate_enum_lookups(&mut f, enum_def)?;
             }
             // An `#[attributes(error_enum)]` status enum also emits the shared
             // FlError companion into the same module.
@@ -7023,5 +7102,46 @@ mod tests {
     #[test]
     fn no_reader_modules_needs_no_test_feature() {
         assert!(!mod_file("none", &[], None).contains("cfg(feature"));
+    }
+
+    /// `[label(...)]` on every variant emits ALL, name/label and their inverses;
+    /// `[reserved]` emits is_reserved; together they compile with the enum.
+    #[test]
+    fn labelled_and_reserved_enum_emits_lookups_that_compile() {
+        let api_def = parse_one(
+            "enum Act {\n    [label(\"Shoulder L\")] ShoulderL = 0,\n    \
+             [reserved] [label(\"Menu\")] Menu = 1,\n}",
+            "act.def",
+        );
+        let edef = &api_def.enums[0];
+        let mut buf = Vec::new();
+        RustGen::generate_data_enum(&mut buf, edef).expect("emit enum");
+        RustGen::generate_enum_lookups(&mut buf, edef).expect("emit lookups");
+        let out = String::from_utf8(buf).expect("utf8");
+
+        assert!(out.contains(
+            "pub const ALL: [Act; 2] = [\n        Act::ShoulderL,\n        Act::Menu,\n    ];"
+        ));
+        assert!(out.contains("            Act::ShoulderL => \"ShoulderL\","));
+        assert!(out.contains("            Act::ShoulderL => \"Shoulder L\","));
+        assert!(out.contains("pub fn from_label(label: &str) -> Option<Self> {"));
+        assert!(out.contains("        matches!(self, Act::Menu)"));
+
+        let Some(rustc) = find_rustc() else {
+            eprintln!("labelled enum compile test skipped: no rustc on PATH");
+            return;
+        };
+        assert!(
+            rustc_compiles(rustc, "labelled_enum", &out),
+            "generated lookups must compile: {out}"
+        );
+    }
+
+    #[test]
+    fn plain_enum_emits_no_lookups() {
+        let api_def = parse_one("enum Plain { A = 0, B = 1, }", "plain.def");
+        let mut buf = Vec::new();
+        RustGen::generate_enum_lookups(&mut buf, &api_def.enums[0]).expect("emit");
+        assert!(buf.is_empty());
     }
 }

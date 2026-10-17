@@ -10,6 +10,7 @@
 
 use crate::api_parser::*;
 use crate::naming::Naming;
+use heck::ToSnakeCase;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::io;
@@ -45,6 +46,7 @@ impl Cgen {
         extern_c: bool,
         layout_asserts: Option<&crate::layout::TypeRegistry>,
         script: &str,
+        spdx_license: Option<&str>,
     ) -> io::Result<()> {
         let module_dir = format!("{}/{}", c_include_root, api_def.module.as_str());
         std::fs::create_dir_all(&module_dir)?;
@@ -54,6 +56,9 @@ impl Cgen {
         let fwd_decl_structs = Self::structs_needing_forward_decl(api_def);
 
         write!(f, "{}", crate::emit_util::header(script))?;
+        if let Some(license) = spdx_license {
+            writeln!(f, "// SPDX-License-Identifier: {}", license)?;
+        }
         writeln!(f)?;
         writeln!(f, "#pragma once")?;
         writeln!(f)?;
@@ -246,7 +251,8 @@ impl Cgen {
         let api_needs = api_value_iter(api_def).any(is_bool_value);
         let fn_field_needs = struct_fn_field_values(api_def).any(is_bool_value);
         let callback_needs = callback_values(api_def).any(is_bool_value);
-        struct_needs || api_needs || fn_field_needs || callback_needs
+        let reserved_needs = api_def.enums.iter().any(|e| e.reserved_entries().is_some());
+        struct_needs || api_needs || fn_field_needs || callback_needs || reserved_needs
     }
 
     /// Whether a header names FlString. It is the one base type api_gen does not
@@ -261,7 +267,8 @@ impl Cgen {
         let api_needs = api_value_iter(api_def).any(is_string_value);
         let fn_field_needs = struct_fn_field_values(api_def).any(is_string_value);
         let callback_needs = callback_values(api_def).any(is_string_value);
-        struct_needs || api_needs || fn_field_needs || callback_needs
+        let label_needs = api_def.enums.iter().any(|e| e.labelled_entries().is_some());
+        struct_needs || api_needs || fn_field_needs || callback_needs || label_needs
     }
 
     /// Whether a header needs `<stddef.h>`: a usize/isize value
@@ -626,7 +633,51 @@ impl Cgen {
                 )?;
             }
         }
-        writeln!(f, "}} {};\n", name)
+        writeln!(f, "}} {};\n", name)?;
+
+        let func_stem = enum_def.name.to_snake_case();
+        if let Some(labelled) = enum_def.labelled_entries() {
+            writeln!(f, "// Canonical display label of each {}.", name)?;
+            writeln!(
+                f,
+                "static inline {} {}({} value) {{",
+                naming.c_string_type(),
+                naming.c_func(&func_stem, "label"),
+                name
+            )?;
+            writeln!(f, "    switch (value) {{")?;
+            for (entry, label) in labelled {
+                writeln!(
+                    f,
+                    "        case {}:\n            return S(\"{}\");",
+                    naming.c_enumerator(stem, &entry.name),
+                    label
+                )?;
+            }
+            writeln!(f, "    }}")?;
+            writeln!(f, "    return S(\"\");")?;
+            writeln!(f, "}}\n")?;
+        }
+        if let Some(reserved) = enum_def.reserved_entries() {
+            writeln!(
+                f,
+                "// Whether a {} is reserved to the side that owns it.",
+                name
+            )?;
+            writeln!(
+                f,
+                "static inline bool {}({} value) {{",
+                naming.c_func(&func_stem, "is_reserved"),
+                name
+            )?;
+            let cases: Vec<String> = reserved
+                .iter()
+                .map(|entry| format!("value == {}", naming.c_enumerator(stem, &entry.name)))
+                .collect();
+            writeln!(f, "    return {};", cases.join(" || "))?;
+            writeln!(f, "}}\n")?;
+        }
+        Ok(())
     }
 
     // -------------------------------------------------------------------------
@@ -1091,6 +1142,7 @@ mod tests {
             false,
             None,
             "scripts/gen.sh",
+            None,
         )
         .expect("generate header");
 
@@ -1532,6 +1584,7 @@ mod tests {
             false,
             None,
             "scripts/gen.sh",
+            None,
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join(api_def.module.as_str()).join("settings.h"))
@@ -2559,6 +2612,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn spdx_license_line_follows_the_banner_only_when_asked() {
+        let mut api_def = ApiDef::default();
+        ApiParser::parse_string(
+            "#[module(lic)]\nstruct Item { id: u32 }",
+            "lic.def",
+            &mut api_def,
+        );
+        ApiParser::second_pass(std::slice::from_mut(&mut api_def), &crate::naming::FL);
+
+        let dir = std::env::temp_dir().join(format!("api_gen_spdx_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let emit = |license: Option<&str>| {
+            Cgen::generate_header(
+                dir.to_str().expect("utf8 path"),
+                &api_def,
+                &BTreeMap::new(),
+                &crate::naming::FL,
+                Some("flowi"),
+                false,
+                None,
+                "scripts/gen.sh",
+                license,
+            )
+            .expect("header");
+            std::fs::read_to_string(dir.join("lic").join("lic.h")).expect("read lic.h")
+        };
+        let licensed = emit(Some("MIT"));
+        let plain = emit(None);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let banner = crate::emit_util::header("scripts/gen.sh");
+        assert!(
+            licensed.starts_with(&format!("{banner}// SPDX-License-Identifier: MIT\n\n")),
+            "SPDX line sits directly under the banner: {licensed}"
+        );
+        assert!(plain.starts_with(&format!("{banner}\n")), "{plain}");
+        assert!(
+            !plain.contains("SPDX"),
+            "no licence line unless asked: {plain}"
+        );
+    }
+
     /// A callback typedef that names a generated struct by pointer is emitted
     /// ahead of every struct body, so the struct needs an up-front forward-decl -
     /// otherwise the function-pointer typedef names an undeclared type.
@@ -2586,6 +2682,7 @@ mod tests {
             false,
             None,
             "scripts/gen.sh",
+            None,
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("view").join("view.h")).expect("read view.h");
@@ -2639,6 +2736,7 @@ mod tests {
             false,
             None,
             "scripts/gen.sh",
+            None,
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("view").join("view.h")).expect("read view.h");
@@ -2701,6 +2799,7 @@ mod tests {
                 false,
                 asserts,
                 "scripts/gen.sh",
+                None,
             )
             .expect("header");
             std::fs::read_to_string(dir.join("pin").join("pin.h")).expect("read pin.h")
@@ -2764,6 +2863,7 @@ mod tests {
             false,
             Some(&registry),
             "scripts/gen.sh",
+            None,
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("pin").join("pin.h")).expect("read pin.h");
@@ -2785,6 +2885,47 @@ mod tests {
         assert!(
             compile_tu(cc, "c_pin_union", &header),
             "the header compiles: {header}"
+        );
+    }
+
+    /// A labelled enum with a reserved variant emits a label switch and an
+    /// is-reserved predicate beside the typedef, and the header compiles.
+    #[test]
+    fn labelled_and_reserved_enum_emits_inline_lookups_that_compile() {
+        let api_def = parse_one(
+            "enum Act {\n    [label(\"Shoulder L\")] ShoulderL = 0,\n    \
+             [reserved] [label(\"Menu\")] Menu = 1,\n}",
+            "act.def",
+        );
+        let mut buf = Vec::new();
+        Cgen::generate_enum(&mut buf, &api_def.enums[0], &crate::naming::FL).expect("emit");
+        let out = String::from_utf8(buf).expect("utf8");
+
+        assert!(out.contains("static inline FlString fl_act_label(FlAct value) {"));
+        assert!(
+            out.contains("        case FlAct_ShoulderL:\n            return S(\"Shoulder L\");")
+        );
+        assert!(out.contains(
+            "static inline bool fl_act_is_reserved(FlAct value) {\n    return value == FlAct_Menu;\n}"
+        ));
+        assert!(Cgen::header_needs_string(&api_def));
+        assert!(Cgen::header_needs_stdbool(&api_def));
+
+        let Some(cc) = find_cc() else {
+            eprintln!("labelled enum C compile test skipped: no C compiler on PATH");
+            return;
+        };
+        let tu = format!(
+            "#include <stdbool.h>\n\
+             typedef struct FlString {{ const char* data; unsigned long long length; }} FlString;\n\
+             #define S(str) ((FlString){{ .data = (str), .length = sizeof(str) - 1 }})\n\
+             {}\n\
+             int probe(void) {{ return (int)fl_act_label(FlAct_Menu).length + fl_act_is_reserved(FlAct_Menu); }}\n",
+            out
+        );
+        assert!(
+            compile_tu(cc, "labelled_enum", &tu),
+            "the lookups compile: {tu}"
         );
     }
 }
