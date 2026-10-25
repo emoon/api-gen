@@ -119,6 +119,7 @@ fn main() {
         test_arena,
         gen_script,
         rust_allow_dead_code,
+        ..Default::default()
     }) {
         Ok(summary) => summary,
         Err(e) => {
