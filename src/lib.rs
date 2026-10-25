@@ -181,8 +181,9 @@ pub struct Config {
     /// of hand-written headers, which no def describes.
     pub export_extra_symbol_files: Vec<PathBuf>,
     /// Also emit the export set as a flat one-symbol-per-line file
-    /// (`<stem>_exports.txt`) for a consumer that links the library statically and
-    /// re-exports the same set from its own executable.
+    /// (`<stem>_exports.txt`, no comments or banner, so a build script can read it
+    /// line by line) for a consumer that links the library statically and re-exports
+    /// the same set from its own executable.
     pub export_symbol_list: bool,
     /// Output dir for the host-side publish marshalling: one `<def>_marshal.rs` per
     /// def whose types pair with host views, plus a mod.rs index. None skips
@@ -611,7 +612,6 @@ fn write_export_list(
     if cfg.export_symbol_list {
         let list_path = export_dir.join(format!("{}_exports.txt", export_stem));
         let mut sf = std::io::BufWriter::new(std::fs::File::create(&list_path)?);
-        writeln!(sf, "# {}", banner)?;
         for sym in symbols {
             writeln!(sf, "{}", sym)?;
         }
@@ -823,8 +823,11 @@ mod tests {
         );
 
         let list = std::fs::read_to_string(export_dir.join("flowi_exports.txt")).expect("list");
-        let names: Vec<&str> = list.lines().filter(|l| !l.starts_with('#')).collect();
-        assert_eq!(names, ["fl_math_math_len", "fl_widget_widget_emit", "hand_one"]);
+        let names: Vec<&str> = list.lines().collect();
+        assert_eq!(
+            names,
+            ["fl_math_math_len", "fl_widget_widget_emit", "hand_one"]
+        );
         let def = std::fs::read_to_string(export_dir.join("flowi.def")).expect("def");
         assert!(def.contains("    fl_math_math_len\n") && def.contains("    hand_one\n"));
 
