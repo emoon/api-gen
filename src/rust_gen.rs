@@ -5156,6 +5156,7 @@ mod tests {
         let src = format!(
             "pub struct LayoutId(pub u64);\n\
              impl From<&str> for LayoutId {{ fn from(_: &str) -> Self {{ LayoutId(0) }} }}\n\
+             impl LayoutId {{ fn into_sys(self) -> u64 {{ self.0 }} }}\n\
              pub mod flowi_sys {{\n\
                 #[repr(C)] #[derive(Copy, Clone)] pub struct PopupConfig {{ pub z: i16 }}\n\
                 #[repr(C)] #[derive(Copy, Clone)] pub struct TooltipConfig {{ pub z: i16 }}\n\
