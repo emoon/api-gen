@@ -153,7 +153,7 @@ impl RustGen {
         {
             return Ok((
                 Some(format!("{}: impl Into<crate::LayoutId>", name)),
-                format!("{}.into().0", name),
+                format!("{}.into().into_sys()", name),
                 Vec::new(),
             ));
         }
@@ -4430,7 +4430,7 @@ mod tests {
     /// The façade emitter turns each `api <Domain>` block into `impl <Domain>` of
     /// methods forwarding to `flowi_sys::fl_*`, applying the mechanical conversions
     /// (string -> `impl AsRef<str>` + arena, `#[handle]` passthrough, LayoutId ->
-    /// `impl Into<LayoutId>` + .into().0, `*T` -> &mut T), while `[manual]` and
+    /// `impl Into<LayoutId>` + .into().into_sys(), `*T` -> &mut T), while `[manual]` and
     /// varargs slots are skipped.
     #[test]
     fn facade_emits_forwarding_methods_with_conversions() {
@@ -4495,7 +4495,7 @@ mod tests {
             "LayoutId + option out-param, _impl stripped: {out}"
         );
         assert!(
-            out.contains("flowi_sys::fl_ui_menu_begin_impl(menu_id.into().0, out.as_mut_ptr())"),
+            out.contains("flowi_sys::fl_ui_menu_begin_impl(menu_id.into().into_sys(), out.as_mut_ptr())"),
             "c_name keeps _impl; out-param is lifted"
         );
         assert!(
@@ -5123,7 +5123,7 @@ mod tests {
             "begin returns the guard: {out}"
         );
         assert!(
-            out.contains("unsafe { flowi_sys::fl_popup_begin(anchor_id.into().0, config) };"),
+            out.contains("unsafe { flowi_sys::fl_popup_begin(anchor_id.into().into_sys(), config) };"),
             "begin forwards: {out}"
         );
         assert!(
