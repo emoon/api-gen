@@ -52,6 +52,11 @@ struct LoweredArgs {
     params: Vec<String>,
     ffi: Vec<String>,
     prelude: Vec<String>,
+    /// Statements that run the caller's own trait implementations (`AsRef::as_ref`,
+    /// `Into::into`) on the safe parameters. The façade surface emits them as plain `let`s
+    /// ahead of the frame guard, so user code never runs while the guard is held; the
+    /// external-consumer surface leaves this empty.
+    pre: Vec<String>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -313,6 +318,7 @@ impl RustGen {
             params: Vec::new(),
             ffi: Vec::new(),
             prelude: Vec::new(),
+            pre: Vec::new(),
         };
         let mut i = 0;
         while i < func.function_args.len() {
@@ -407,12 +413,15 @@ impl RustGen {
                     }
                     let packed = format!("{}_frame", name);
                     lowered.params.push(format!("{}: &[impl AsRef<str>]", name));
+                    lowered.pre.push(format!(
+                        "let {name}: Vec<&str> = {name}.iter().map(|s| s.as_ref()).collect();"
+                    ));
                     lowered.prelude.push(format!(
                         "let {} = flowi_sys::fl_frame_str_array({}.len() as u32);",
                         packed, name
                     ));
                     lowered.prelude.push(format!(
-                        "for (i, s) in {}.iter().enumerate() {{ let s = s.as_ref(); *{}.add(i) = \
+                        "for (i, s) in {}.iter().enumerate() {{ *{}.add(i) = \
                          flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()); }}",
                         name, packed
                     ));
@@ -432,6 +441,29 @@ impl RustGen {
                 lowered.ffi.push(format!("{}.len() as u32", name));
                 i += 1;
                 continue;
+            }
+            if surface == LooseSymbolSurface::DirectLink {
+                let name = Self::rust_ident(&arg.name);
+                if arg.vtype == VariableType::Str && !arg.is_extern_opaque && !arg.is_transfer {
+                    lowered.params.push(format!("{}: impl AsRef<str>", name));
+                    lowered.pre.push(format!("let {name} = {name}.as_ref();"));
+                    lowered
+                        .ffi
+                        .push(Self::lower_string_arg(surface, func, &name));
+                    i += 1;
+                    continue;
+                }
+                if arg.type_name == "LayoutId" && arg.vtype == VariableType::Regular {
+                    lowered
+                        .params
+                        .push(format!("{}: impl Into<crate::LayoutId>", name));
+                    lowered
+                        .pre
+                        .push(format!("let {name}: crate::LayoutId = {name}.into();"));
+                    lowered.ffi.push(format!("{name}.into_sys()"));
+                    i += 1;
+                    continue;
+                }
             }
             let (param, ffi, mut prelude) = Self::lower_loose_symbol_arg(surface, func, arg)?;
             if let Some(param) = param {
@@ -1458,11 +1490,11 @@ impl RustGen {
         func: &Function,
         handle: Option<&str>,
         out_idx: Option<usize>,
-    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+    ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
         let lowered =
             Self::lower_loose_symbol_args(LooseSymbolSurface::DirectLink, func, handle, out_idx)
                 .unwrap_or_else(|diag| panic!("{}", diag));
-        (lowered.params, lowered.ffi, lowered.prelude)
+        (lowered.params, lowered.ffi, lowered.prelude, lowered.pre)
     }
 
     /// Façade return spelling: (type_after_arrow, wrap), or None for a ()
@@ -1553,6 +1585,7 @@ impl RustGen {
     fn write_facade_method<W: Write>(
         f: &mut W,
         guard: Option<&FrameGuard>,
+        pre: &[String],
         method: &str,
         params: &str,
         ret_ty: Option<&str>,
@@ -1567,6 +1600,9 @@ impl RustGen {
         match ret_ty {
             None => writeln!(f, "    pub fn {}({}) {{", method, params)?,
             Some(ret) => writeln!(f, "    pub fn {}({}) -> {} {{", method, params, ret)?,
+        }
+        for line in pre {
+            writeln!(f, "        {}", line)?;
         }
         if let Some(guard) = guard {
             guard.write_statement(f, method)?;
@@ -1869,7 +1905,7 @@ impl RustGen {
             return Self::generate_facade_option_fn(f, func, guard);
         }
         let method = Self::facade_method_name(&func.name);
-        let (params, ffi, prelude) = Self::facade_args(func, None, None);
+        let (params, ffi, prelude, pre) = Self::facade_args(func, None, None);
         let params = params.join(", ");
         let ffi = ffi.join(", ");
         // The public method drops any _impl suffix; the C function keeps its full
@@ -1884,7 +1920,7 @@ impl RustGen {
         if method == "new" {
             writeln!(f, "    #[allow(clippy::new_ret_no_self)]")?;
         }
-        Self::write_facade_method(f, guard, method, &params, ret_ty.as_deref(), |f| {
+        Self::write_facade_method(f, guard, &pre, method, &params, ret_ty.as_deref(), |f| {
             Self::write_unsafe_body(f, &prelude, &tail)
         })
     }
@@ -1901,13 +1937,14 @@ impl RustGen {
             unreachable!("option emitter called for non-option slot")
         };
         let out_idx = Self::out_param_index(func).expect("option shape has out param");
-        let (params, ffi, prelude) = Self::facade_args(func, None, Some(out_idx));
+        let (params, ffi, prelude, pre) = Self::facade_args(func, None, Some(out_idx));
         let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
         let method = Self::facade_method_name(&func.name);
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
             guard,
+            &pre,
             method,
             &params.join(", "),
             Some(&format!("Option<{}>", ty)),
@@ -1940,19 +1977,27 @@ impl RustGen {
         else {
             unreachable!("transfer emitter called for non-transfer slot")
         };
-        let (params, ffi, prelude) = Self::facade_args(func, None, None);
+        let (params, ffi, prelude, pre) = Self::facade_args(func, None, None);
         let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
         let method = Self::facade_method_name(&func.name);
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, guard, method, &params.join(", "), Some(&owned_ty), |f| {
-            writeln!(f, "        unsafe {{")?;
-            for line in &prelude {
-                writeln!(f, "            {}", line)?;
-            }
-            writeln!(f, "            let ptr = {};", call)?;
-            writeln!(f, "            {} {{ ptr }}", owned_ty)?;
-            writeln!(f, "        }}")
-        })
+        Self::write_facade_method(
+            f,
+            guard,
+            &pre,
+            method,
+            &params.join(", "),
+            Some(&owned_ty),
+            |f| {
+                writeln!(f, "        unsafe {{")?;
+                for line in &prelude {
+                    writeln!(f, "            {}", line)?;
+                }
+                writeln!(f, "            let ptr = {};", call)?;
+                writeln!(f, "            {} {{ ptr }}", owned_ty)?;
+                writeln!(f, "        }}")
+            },
+        )
     }
 
     /// Emit a `[status]` façade method: `pub fn <m>(...) -> Result<T, crate::FlError>`,
@@ -1972,7 +2017,7 @@ impl RustGen {
         };
         let method = Self::facade_method_name(&func.name);
         let out_idx = Self::out_param_index(func);
-        let (params, ffi, prelude) = Self::facade_args(func, None, out_idx);
+        let (params, ffi, prelude, pre) = Self::facade_args(func, None, out_idx);
         let params = params.join(", ");
         let ffi = ffi.join(", ");
         let call = format!("flowi_sys::{}({})", func.c_name, ffi);
@@ -1981,7 +2026,7 @@ impl RustGen {
         Self::write_comment(f, &func.doc_comments, 4)?;
         // The slot call (and any `[retained]` prelude) share one unsafe block, then
         // the status decode and Ok-lift stay in safe code so ? reads cleanly.
-        Self::write_facade_method(f, guard, method, &params, Some(&ret_ty), |f| {
+        Self::write_facade_method(f, guard, &pre, method, &params, Some(&ret_ty), |f| {
             if has_out {
                 writeln!(
                     f,
@@ -2100,7 +2145,7 @@ impl RustGen {
             return Self::generate_raii_transfer_method(f, func, handle, receiver, method);
         }
 
-        let (arg_params, ffi, prelude) = Self::facade_args(func, Some(handle), None);
+        let (arg_params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), None);
         let mut params = vec![receiver.to_owned()];
         params.extend(arg_params);
         let params = params.join(", ");
@@ -2118,7 +2163,7 @@ impl RustGen {
         };
 
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, None, method, &params, ret_ty.as_deref(), |f| {
+        Self::write_facade_method(f, None, &pre, method, &params, ret_ty.as_deref(), |f| {
             Self::write_unsafe_body(f, &prelude, &tail)
         })
     }
@@ -2137,13 +2182,14 @@ impl RustGen {
             unreachable!()
         };
         let out_idx = Self::out_param_index(func);
-        let (mut params, ffi, prelude) = Self::facade_args(func, Some(handle), out_idx);
+        let (mut params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), out_idx);
         params.insert(0, receiver.to_owned());
         let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
             None,
+            &pre,
             method,
             &params.join(", "),
             Some(&format!("Result<{}, crate::FlError>", ok_ty)),
@@ -2190,13 +2236,14 @@ impl RustGen {
             unreachable!()
         };
         let out_idx = Self::out_param_index(func).expect("option shape has out param");
-        let (mut params, ffi, prelude) = Self::facade_args(func, Some(handle), Some(out_idx));
+        let (mut params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), Some(out_idx));
         params.insert(0, receiver.to_owned());
         let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
             None,
+            &pre,
             method,
             &params.join(", "),
             Some(&format!("Option<{}>", ty)),
@@ -2231,19 +2278,27 @@ impl RustGen {
         else {
             unreachable!()
         };
-        let (mut params, ffi, prelude) = Self::facade_args(func, Some(handle), None);
+        let (mut params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), None);
         params.insert(0, receiver.to_owned());
         let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, None, method, &params.join(", "), Some(&owned_ty), |f| {
-            writeln!(f, "        unsafe {{")?;
-            for line in &prelude {
-                writeln!(f, "            {}", line)?;
-            }
-            writeln!(f, "            let ptr = {};", call)?;
-            writeln!(f, "            {} {{ ptr }}", owned_ty)?;
-            writeln!(f, "        }}")
-        })
+        Self::write_facade_method(
+            f,
+            None,
+            &pre,
+            method,
+            &params.join(", "),
+            Some(&owned_ty),
+            |f| {
+                writeln!(f, "        unsafe {{")?;
+                for line in &prelude {
+                    writeln!(f, "            {}", line)?;
+                }
+                writeln!(f, "            let ptr = {};", call)?;
+                writeln!(f, "            {} {{ ptr }}", owned_ty)?;
+                writeln!(f, "        }}")
+            },
+        )
     }
 
     /// Emit one RAII opaque-handle block: the handle-owning struct, its Drop
@@ -2405,7 +2460,7 @@ impl RustGen {
         guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let method = Self::facade_method_name(&func.name);
-        let (params, ffi, prelude) = Self::facade_args(func, None, None);
+        let (params, ffi, prelude, pre) = Self::facade_args(func, None, None);
         assert!(
             prelude.is_empty(),
             "[retained] is only supported on stateless façade slots ({})",
@@ -2416,7 +2471,7 @@ impl RustGen {
         let call = format!("flowi_sys::{}({})", func.c_name, ffi);
 
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, guard, method, &params, Some(scope_ty), |f| {
+        Self::write_facade_method(f, guard, &pre, method, &params, Some(scope_ty), |f| {
             writeln!(f, "        unsafe {{ {} }};", call)?;
             writeln!(f, "        {} {{ _priv: () }}", scope_ty)
         })
@@ -2524,16 +2579,21 @@ impl RustGen {
                     write!(f, "{}", owned)?;
                 }
             }
-            let guard = frame_guard
-                .filter(|_| api.is_frame_context)
-                .map(|path| FrameGuard {
-                    path,
-                    block: &api.name,
-                });
+            let guard = frame_guard.map(|path| FrameGuard {
+                path,
+                block: &api.name,
+            });
+            // The block's guard applies to every slot of a `#[frame_context]` block and
+            // to the `[frame]` slots of any other.
+            let slot_guard = |func: &Function| {
+                guard
+                    .as_ref()
+                    .filter(|_| api.is_frame_context || func.is_frame)
+            };
             if let Some(drop_fn) = Self::api_drop_fn(api) {
                 assert!(
-                    guard.is_none(),
-                    "api_gen: façade `{}`: #[frame_context] is not supported on a block with a [drop] slot",
+                    !api.is_frame_context && !api.functions.iter().any(|func| func.is_frame),
+                    "api_gen: façade `{}`: #[frame_context] and [frame] are not supported on a block with a [drop] slot",
                     api.name
                 );
                 Self::generate_raii_facade(f, api, drop_fn)?;
@@ -2567,17 +2627,17 @@ impl RustGen {
                         f,
                         func,
                         &Self::scope_guard_name(api),
-                        guard.as_ref(),
+                        slot_guard(func),
                     )?;
                 } else if scope.is_some() && func.is_scope_end {
                     Self::generate_scope_end_fn(
                         f,
                         func,
                         &Self::scope_guard_name(api),
-                        guard.as_ref(),
+                        slot_guard(func),
                     )?;
                 } else {
-                    Self::generate_facade_fn(f, func, guard.as_ref())?;
+                    Self::generate_facade_fn(f, func, slot_guard(func))?;
                 }
             }
             writeln!(f, "}}")?;
@@ -2997,6 +3057,7 @@ impl RustGen {
             params,
             ffi,
             prelude,
+            ..
         } = Self::service_call_args(func, None)?;
         let answer = if record.optional {
             format!("Option<{}>", record.owned)
@@ -3037,6 +3098,7 @@ impl RustGen {
             params,
             ffi,
             prelude,
+            ..
         } = Self::service_call_args(func, None)?;
         let cls = Self::classify_plain_return(func)?;
         out.push_str("    #[inline]\n");
@@ -3112,6 +3174,7 @@ impl RustGen {
             params,
             ffi,
             prelude,
+            ..
         } = Self::service_call_args(func, out_idx)?;
         out.push_str("    #[inline]\n");
         out.push_str(&format!(
@@ -3166,6 +3229,7 @@ impl RustGen {
             params,
             ffi,
             prelude,
+            ..
         } = Self::service_call_args(func, Some(out_idx))?;
         out.push_str("    #[inline]\n");
         out.push_str(&format!(
@@ -3215,6 +3279,7 @@ impl RustGen {
             params,
             ffi,
             prelude,
+            ..
         } = Self::service_call_args(func, None)?;
         out.push_str("    #[inline]\n");
         out.push_str(&format!(
@@ -3715,6 +3780,85 @@ mod tests {
         assert!(
             !emit("#[frame_context]", None).contains("_frame"),
             "no path"
+        );
+    }
+
+    fn emit_gadget(dir_tag: &str, defs: &str, path: Option<&str>) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "api_gen_{dir_tag}_{}_{}",
+            std::process::id(),
+            std::thread::current()
+                .name()
+                .unwrap_or("t")
+                .replace("::", "_")
+        ));
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        let def = parse_one(defs, "gadget.def");
+        RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", path)
+            .expect("facade");
+        std::fs::read_to_string(dir.join("gadget.rs")).expect("read facade")
+    }
+
+    /// `[frame]` guards exactly its own slot in a block that is not `#[frame_context]`.
+    #[test]
+    fn frame_slot_marker_guards_only_that_slot() {
+        let out = emit_gadget(
+            "frame_slot",
+            "api Gadget {\n\
+                 [frame] poke(x: u32)\n\
+                 peek(x: u32)\n\
+             }",
+            Some("crate::frame_thread::frame_thread_guard"),
+        );
+        assert!(
+            out.contains("frame_thread_guard(\"Gadget::poke\")"),
+            "{out}"
+        );
+        assert_eq!(out.matches("let _frame").count(), 1, "{out}");
+    }
+
+    /// The caller's own trait implementations (`AsRef::as_ref`, `Into::into`) run in plain
+    /// `let`s ahead of the guard, so user code never runs while the guard is held. The
+    /// frame-arena copies and the C call stay inside it.
+    #[test]
+    fn frame_guard_follows_every_user_conversion() {
+        let out = emit_gadget(
+            "frame_pre",
+            "#[frame_context] api Gadget {\n\
+                 show(label: String, anchor: LayoutId)\n\
+                 [borrowed] note(text: String)\n\
+                 pick(items: [*const String], selected: *i32)\n\
+             }",
+            Some("crate::frame_thread::frame_thread_guard"),
+        );
+        for method in ["show", "note", "pick"] {
+            let body = out
+                .split(&format!("pub fn {method}("))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{method}: {out}"))
+                .split("\n    }\n")
+                .next()
+                .unwrap();
+            let guard = body.find("let _frame").expect("guarded");
+            let call = body.find("unsafe").expect("call");
+            assert!(guard < call, "{method}: {body}");
+            for user_code in ["as_ref()", ".into()", ".iter().map("] {
+                if let Some(at) = body.find(user_code) {
+                    assert!(
+                        at < guard,
+                        "{method}: `{user_code}` runs under the guard: {body}"
+                    );
+                }
+            }
+        }
+        assert!(out.contains("let label = label.as_ref();"), "{out}");
+        assert!(
+            out.contains("let anchor: crate::LayoutId = anchor.into();"),
+            "{out}"
+        );
+        assert!(
+            out.contains("let items: Vec<&str> = items.iter().map(|s| s.as_ref()).collect();"),
+            "{out}"
         );
     }
 
@@ -4654,7 +4798,7 @@ mod tests {
             "string + handle args"
         );
         assert!(
-            out.contains("{ let s = text.as_ref(); flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }, font)"),
+            out.contains("{ let s = text; flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }, font)"),
             "string arena + handle passthrough"
         );
         assert!(
@@ -4667,9 +4811,7 @@ mod tests {
             "LayoutId + option out-param, _impl stripped: {out}"
         );
         assert!(
-            out.contains(
-                "flowi_sys::fl_ui_menu_begin_impl(menu_id.into().into_sys(), out.as_mut_ptr())"
-            ),
+            out.contains("flowi_sys::fl_ui_menu_begin_impl(menu_id.into_sys(), out.as_mut_ptr())"),
             "c_name keeps _impl; out-param is lifted"
         );
         assert!(
@@ -4856,13 +4998,11 @@ mod tests {
         }
         let fout = String::from_utf8(fbuf).unwrap();
         assert!(
-            fout.contains(
-                "flowi_sys::fl_font_load(flowi_sys::RawStr::borrow(path.as_ref()), default_size)"
-            ),
+            fout.contains("flowi_sys::fl_font_load(flowi_sys::RawStr::borrow(path), default_size)"),
             "borrowed slot lowers via RawStr::borrow: {fout}"
         );
         assert!(
-            fout.contains("{ let s = label.as_ref(); flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }"),
+            fout.contains("{ let s = label; flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }"),
             "unmarked slot keeps arena copy: {fout}"
         );
 
@@ -4886,7 +5026,9 @@ mod tests {
             "set_text receiver + arg: {tout}"
         );
         assert!(
-            tout.contains("flowi_sys::fl_text_input_set_text(self.handle, flowi_sys::RawStr::borrow(text.as_ref()))"),
+            tout.contains(
+                "flowi_sys::fl_text_input_set_text(self.handle, flowi_sys::RawStr::borrow(text))"
+            ),
             "set_text borrows + threads handle: {tout}"
         );
         assert!(
@@ -5023,8 +5165,8 @@ mod tests {
             "each string is copied into the reserved frame-arena slot: {out}"
         );
         assert!(
-            !out.contains("Vec<"),
-            "no heap allocation is introduced for the packed array: {out}"
+            out.contains("let tabs: Vec<&str> = tabs.iter().map(|s| s.as_ref()).collect();"),
+            "the caller's AsRef runs before the arena copy: {out}"
         );
         assert!(
             out.contains("flowi_sys::fl_tabs_impl(tabs_frame, tabs.len() as u32"),
@@ -5120,7 +5262,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "flowi_sys::fl_widget_show({ let s = label.as_ref(); flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }, self.handle)"
+                "flowi_sys::fl_widget_show({ let s = label; flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }, self.handle)"
             ),
             "handle threaded in 2nd position: {out}"
         );
@@ -5297,9 +5439,7 @@ mod tests {
             "begin returns the guard: {out}"
         );
         assert!(
-            out.contains(
-                "unsafe { flowi_sys::fl_popup_begin(anchor_id.into().into_sys(), config) };"
-            ),
+            out.contains("unsafe { flowi_sys::fl_popup_begin(anchor_id.into_sys(), config) };"),
             "begin forwards: {out}"
         );
         assert!(
@@ -5460,10 +5600,9 @@ mod tests {
         let external_string =
             RustGen::lower_loose_symbol_args(external, function("label"), None, None).unwrap();
         assert_eq!(direct_string.params, external_string.params);
-        assert_eq!(
-            direct_string.ffi,
-            ["flowi_sys::RawStr::borrow(text.as_ref())"]
-        );
+        assert_eq!(direct_string.ffi, ["flowi_sys::RawStr::borrow(text)"]);
+        assert_eq!(direct_string.pre, ["let text = text.as_ref();"]);
+        assert!(external_string.pre.is_empty());
         assert_eq!(
             external_string.ffi,
             ["crate::RawStr::borrow(text.as_ref())"]

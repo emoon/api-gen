@@ -292,6 +292,9 @@ pub struct Function {
     /// any thread. When a whole service is thread-safe the wrapper gains
     /// unsafe impl Send + Sync. C / sys output is unaffected.
     pub is_thread_safe: bool,
+    /// `[frame]`: this slot's façade forwarder opens with the frame guard even when its
+    /// block is not `#[frame_context]`.
+    pub is_frame: bool,
 }
 
 impl Default for Function {
@@ -317,6 +320,7 @@ impl Default for Function {
             transfer_free: None,
             is_status: false,
             is_thread_safe: false,
+            is_frame: false,
         }
     }
 }
@@ -1199,6 +1203,7 @@ impl ApiParser {
                 }
                 Rule::status_typ => function.is_status = true,
                 Rule::thread_safe_typ => function.is_thread_safe = true,
+                Rule::frame_typ => function.is_frame = true,
                 Rule::rename_typ => {
                     function.rename = Self::first_child_str(entry, Rule::name);
                 }

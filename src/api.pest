@@ -122,7 +122,7 @@ apifnlist = { (doc_comment | apifn)* }
 // the C prototype, call macro, and export entry are emitted as usual, but no
 // Rust binding or wrapper — the marker comes off when a Rust consumer arrives.
 // None of these markers alter the C / sys output.
-apifn     = { (manual_typ | drop_typ | const_typ | rename_typ | scope_begin_typ | scope_end_typ | borrowed_typ | retained_typ | transfer_typ | status_typ | thread_safe_typ | c_only_typ)* ~ name ~ ("(") ~ apiargs? ~ (")") ~ retexp? }
+apifn     = { (manual_typ | drop_typ | const_typ | rename_typ | scope_begin_typ | scope_end_typ | borrowed_typ | retained_typ | transfer_typ | status_typ | thread_safe_typ | c_only_typ | frame_typ)* ~ name ~ ("(") ~ apiargs? ~ (")") ~ retexp? }
 apiargs   = { apiarg ~ ((",") ~ apiarg)* }
 // A `[slice(T)]` / `[slice_mut(T)]` data arg and its immediately-following
 // count arg collapse to one `&[T]` / `&mut [T]` Rust façade param (`slice_arg`,
@@ -193,6 +193,10 @@ status_typ   = { ("[status]") }
 // `[thread_safe]` (service-consume wrapper) — the slot is safe to call from any
 // thread. A whole service marked thread-safe (block attribute) or every generated
 // slot marked emits `unsafe impl Send + Sync` on the wrapper. C / sys unaffected.
+// `[frame]` — the Rust façade forwarder for this slot opens with the configured frame guard,
+// like every slot of a `#[frame_context]` block; it marks the frame-bound slots of an
+// otherwise unmarked block.
+frame_typ     = { ("[frame]") }
 thread_safe_typ = { ("[thread_safe]") }
 slice_typ     = { ("[slice(") ~ vtype ~ (")]") }
 array_typ     = { ("[array(") ~ vtype ~ (",") ~ name_or_num ~ (")]") }
