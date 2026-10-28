@@ -1001,11 +1001,16 @@ fn callback_values(api_def: &ApiDef) -> impl Iterator<Item = &Variable> {
         .flat_map(|cb| cb.function_args.iter().chain(cb.return_val.iter()))
 }
 
+/// Suffixes of the by-value struct types a designated-initializer convenience macro
+/// builds: option bags a caller fills field by field. Handles, ids, colors, events
+/// and other whole values are passed as plain expressions and never wrapped.
+const CONFIG_TYPE_SUFFIXES: [&str; 3] = ["Config", "Opts", "Options"];
+
 /// The trailing by-value config struct of an api slot, if any - the arg a
 /// designated-initializer convenience macro builds from __VA_ARGS__. It is the
-/// last non-self arg and must be a by-value generated struct:
-/// VariableType::Regular, not a pointer, and not an array. A `callback <Name>`
-/// arg is a named type too but a function-pointer typedef, not
+/// last non-self arg and must be a by-value generated struct named *Config,
+/// *Opts or *Options: VariableType::Regular, not a pointer, and not an array. A
+/// `callback <Name>` arg is a named type too but a function-pointer typedef, not
 /// designated-initializable, so it is excluded explicitly via is_callback.
 fn convenience_config_arg(func: &Function) -> Option<&Variable> {
     let last = func
@@ -1018,7 +1023,10 @@ fn convenience_config_arg(func: &Function) -> Option<&Variable> {
         && !last.pointer
         && !last.const_pointer
         && last.array.is_none();
-    by_value_struct.then_some(last)
+    let config_named = CONFIG_TYPE_SUFFIXES
+        .iter()
+        .any(|suffix| last.type_name.ends_with(suffix));
+    (by_value_struct && config_named).then_some(last)
 }
 
 /// Whether a value is a fixed-width primitive (u32/i16/...) - it names a
@@ -2261,20 +2269,16 @@ mod tests {
     fn scope_end_whole_struct_slot_gets_no_convenience_macro() {
         let api_def = parse_one(
             "#[attributes(Opaque)] struct Arena {}\n\
-             struct TempArena { arena: *Arena, pos: u64 }\n\
+             struct TempConfig { arena: *Arena, pos: u64 }\n\
              #[attributes(service)] api Arena {\n\
-                 [scope_begin] arena_temp_begin(arena: *Arena) -> TempArena\n\
-                 [scope_end] arena_temp_end(temp: TempArena)\n\
+                 [scope_begin] arena_temp_begin(arena: *Arena) -> TempConfig\n\
+                 [scope_end] arena_temp_end(temp: TempConfig)\n\
              }",
             "arena.def",
         );
 
         let end = &api_def.apis[0].functions[1];
         assert!(end.is_scope_end, "the slot parses as [scope_end]");
-        assert!(
-            convenience_config_arg(end).is_some(),
-            "its whole-struct-by-value arg would otherwise be treated as a config slot"
-        );
 
         let mut buf = Vec::new();
         for api in &api_def.apis {
@@ -2283,7 +2287,7 @@ mod tests {
         let out = String::from_utf8(buf).expect("utf8");
 
         assert!(
-            out.contains("FL_API void arena_temp_end(FlTempArena temp);"),
+            out.contains("FL_API void arena_temp_end(FlTempConfig temp);"),
             "the scope-end slot emits its bare FL_API prototype: {out}"
         );
         assert!(
@@ -2304,18 +2308,14 @@ mod tests {
     #[test]
     fn service_whole_struct_slot_suppresses_macro_but_non_service_keeps_it() {
         let service = parse_one(
-            "struct StringBuilder { data: *void, len: u64 }\n\
+            "struct BuilderConfig { data: *void, len: u64 }\n\
              #[attributes(service)] api String {\n\
-                 sb_clear(sb: StringBuilder) -> StringBuilder\n\
+                 sb_clear(sb: BuilderConfig) -> BuilderConfig\n\
              }",
             "string.def",
         );
         let clear = &service.apis[0].functions[0];
         assert!(!clear.is_scope_end, "the control slot is NOT [scope_end]");
-        assert!(
-            convenience_config_arg(clear).is_some(),
-            "its whole-struct-by-value arg would otherwise be treated as a config slot"
-        );
 
         let mut buf = Vec::new();
         for api in &service.apis {
@@ -2323,7 +2323,7 @@ mod tests {
         }
         let svc_out = String::from_utf8(buf).expect("utf8");
         assert!(
-            svc_out.contains("FL_API FlStringBuilder sb_clear(FlStringBuilder sb);"),
+            svc_out.contains("FL_API FlBuilderConfig sb_clear(FlBuilderConfig sb);"),
             "the service slot emits its bare raw-name prototype: {svc_out}"
         );
         assert!(
@@ -2332,9 +2332,9 @@ mod tests {
         );
 
         let plain = parse_one(
-            "struct StringBuilder { data: *void, len: u64 }\n\
+            "struct BuilderConfig { data: *void, len: u64 }\n\
              api String {\n\
-                 sb_clear(sb: StringBuilder) -> StringBuilder\n\
+                 sb_clear(sb: BuilderConfig) -> BuilderConfig\n\
              }",
             "string.def",
         );
@@ -2350,11 +2350,35 @@ mod tests {
     }
 
     #[test]
+    fn only_config_named_structs_get_a_convenience_macro() {
+        let api_def = parse_one(
+            "struct Color { r: u8 }\n\
+             struct DrawOpts { a: i32 }\n\
+             api Painter { rect(x: f32, color: Color)\n\
+                           styled(x: f32, opts: DrawOpts) }",
+            "painter.def",
+        );
+        let mut buf = Vec::new();
+        for api in &api_def.apis {
+            Cgen::generate_api_decls(&mut buf, api, &crate::naming::FL).expect("api decls");
+        }
+        let out = String::from_utf8(buf).expect("utf8");
+        assert!(
+            !out.contains("#define fl_painter_rect("),
+            "a plain value struct is passed as an expression: {out}"
+        );
+        assert!(
+            out.contains("#define fl_painter_styled(x, ...) fl_painter_styled(x, (FlDrawOpts) { __VA_ARGS__ })"),
+            "an *Opts struct keeps its designated-init macro: {out}"
+        );
+    }
+
+    #[test]
     fn impl_slot_gets_a_lowercase_call_macro() {
         let api_def = parse_one(
-            "struct Cfg { a: i32 }\n\
-             api Menu { radio_impl(label: String, config: Cfg) -> bool\n\
-                        set(value: Cfg) }",
+            "struct Config { a: i32 }\n\
+             api Menu { radio_impl(label: String, config: Config) -> bool\n\
+                        set(value: Config) }",
             "menu.def",
         );
 
@@ -2366,7 +2390,7 @@ mod tests {
 
         assert!(
             out.contains(
-                "#define fl_menu_radio(label, ...) fl_menu_radio_impl(label, (FlCfg) { __VA_ARGS__ })"
+                "#define fl_menu_radio(label, ...) fl_menu_radio_impl(label, (FlConfig) { __VA_ARGS__ })"
             ),
             "_impl slot emits a lowercase call macro: {out}"
         );
@@ -2375,7 +2399,7 @@ mod tests {
             "no SHOUTY _IMPL macro survives: {out}"
         );
         assert!(
-            out.contains("#define fl_menu_set(...) fl_menu_set((FlCfg) { __VA_ARGS__ })"),
+            out.contains("#define fl_menu_set(...) fl_menu_set((FlConfig) { __VA_ARGS__ })"),
             "non-_impl direct wrapper is lowercase: {out}"
         );
     }
@@ -2407,8 +2431,8 @@ mod tests {
 
         // new_impl slot with a config struct: fl_button_impl body + bare fl_button macro.
         let api_def = parse_one(
-            "struct Cfg { a: i32 }\n\
-                                 api Button { new_impl(label: String, config: Cfg) -> Signal }",
+            "struct Config { a: i32 }\n\
+                                 api Button { new_impl(label: String, config: Config) -> Signal }",
             "button.def",
         );
         let mut buf = Vec::new();
@@ -2417,12 +2441,12 @@ mod tests {
         }
         let out = String::from_utf8(buf).expect("utf8");
         assert!(
-            out.contains("fl_button_impl(FlString label, FlCfg config)"),
+            out.contains("fl_button_impl(FlString label, FlConfig config)"),
             "impl body: {out}"
         );
         assert!(
             out.contains(
-                "#define fl_button(label, ...) fl_button_impl(label, (FlCfg) { __VA_ARGS__ })"
+                "#define fl_button(label, ...) fl_button_impl(label, (FlConfig) { __VA_ARGS__ })"
             ),
             "bare convenience macro: {out}"
         );
@@ -2433,8 +2457,8 @@ mod tests {
     #[test]
     fn slice_arg_threads_size_companion_into_convenience_macro() {
         let api_def = parse_one(
-            "struct Cfg { a: i32 }\n\
-             api Tabs { new_impl(tabs: [*const String], selected: *i32, config: Cfg) -> bool }",
+            "struct Config { a: i32 }\n\
+             api Tabs { new_impl(tabs: [*const String], selected: *i32, config: Config) -> bool }",
             "tabs.def",
         );
         let mut buf = Vec::new();
@@ -2443,12 +2467,12 @@ mod tests {
         }
         let out = String::from_utf8(buf).expect("utf8");
         assert!(
-            out.contains("fl_tabs_impl(const FlString* tabs, uint32_t tabs_size, int32_t* selected, FlCfg config)"),
+            out.contains("fl_tabs_impl(const FlString* tabs, uint32_t tabs_size, int32_t* selected, FlConfig config)"),
             "prototype expands slice to pointer + size: {out}"
         );
         assert!(
             out.contains(
-                "#define fl_tabs(tabs, tabs_size, selected, ...) fl_tabs_impl(tabs, tabs_size, selected, (FlCfg) { __VA_ARGS__ })"
+                "#define fl_tabs(tabs, tabs_size, selected, ...) fl_tabs_impl(tabs, tabs_size, selected, (FlConfig) { __VA_ARGS__ })"
             ),
             "macro takes and forwards the size companion: {out}"
         );
@@ -2532,9 +2556,8 @@ mod tests {
         );
         assert!(!cursor_h.contains("g_fl_ui"), "no root-vtable routing");
         assert!(
-            cursor_h
-                .contains("#define fl_cursor_set(...) fl_cursor_set((FlCursor) { __VA_ARGS__ })"),
-            "the direct cursor wrapper is lowercase"
+            !cursor_h.contains("#define fl_cursor_set"),
+            "a by-value arg that is not a config struct gets no convenience macro"
         );
         assert!(
             !cursor_h.contains("FL_CURSOR_SET_VISIBLE"),
@@ -2566,7 +2589,7 @@ mod tests {
              bool fl_cursor_get_visible(void) {{ return true; }}\n\
              FlString fl_format_frame_string(const char* fmt, ...) {{ (void)fmt; FlString s = {{ 0, 0 }}; return s; }}\n\
              int use_api(void) {{\n\
-                 fl_cursor_set(.shape = FlCursorShape_Text);\n\
+                 fl_cursor_set((FlCursor) {{ .shape = FlCursorShape_Text }});\n\
                  FlCursor c = fl_cursor_get_requested();\n\
                  fl_cursor_set_visible(fl_cursor_get_visible());\n\
                  FlString s = fl_format_frame_string(\"%d\", 1);\n\

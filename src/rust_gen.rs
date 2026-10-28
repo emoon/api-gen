@@ -1584,12 +1584,15 @@ impl RustGen {
         var.mirror.as_ref()
     }
 
-    /// The safe twin's Default value for one mirrored field: the C zero default,
-    /// spelled safely. A pass-through field is read out of the zeroed ABI struct the
-    /// emitter binds as zero, which is how a field of any scalar shape gets its zero
-    /// without the generator needing a per-type literal.
+    /// The safe twin's Default value for one mirrored field: the declared `= value`
+    /// of a bool or numeric field, else the C zero default, spelled safely. A
+    /// pass-through field is read out of the zeroed ABI struct the emitter binds as
+    /// zero, which is how a field of any scalar shape gets its zero without the
+    /// generator needing a per-type literal.
     fn mirror_field_default(var: &Variable) -> String {
-        if var.vtype == VariableType::Str {
+        if let Some(literal) = Self::mirror_declared_default(var) {
+            literal
+        } else if var.vtype == VariableType::Str {
             "\"\"".to_owned()
         } else if Self::mirror_field_nested(var).is_some() {
             // The nested twin's own Default, so the whole tree still reproduces
@@ -1601,6 +1604,31 @@ impl RustGen {
             "core::ptr::null_mut()".to_owned()
         } else {
             format!("zero.{}", Self::rust_ident(&var.name))
+        }
+    }
+
+    /// The Rust literal for a by-value bool or numeric field's declared `= value`,
+    /// if it has one. An integer literal on a float field gains a `.0`.
+    fn mirror_declared_default(var: &Variable) -> Option<String> {
+        if var.default_value.is_empty()
+            || var.vtype != VariableType::Primitive
+            || var.pointer
+            || var.const_pointer
+            || var.array.is_some()
+        {
+            return None;
+        }
+        let value = var.default_value.as_str();
+        match var.type_name.as_str() {
+            "bool" if value == "true" || value == "false" => Some(value.to_owned()),
+            "f32" | "f64" if value.parse::<f64>().is_ok() => Some(if value.contains('.') {
+                value.to_owned()
+            } else {
+                format!("{value}.0")
+            }),
+            "bool" | "f32" | "f64" | "char" | "void" => None,
+            _ if value.parse::<i128>().is_ok() => Some(value.to_owned()),
+            _ => None,
         }
     }
 
@@ -4495,7 +4523,9 @@ mod tests {
             "LayoutId + option out-param, _impl stripped: {out}"
         );
         assert!(
-            out.contains("flowi_sys::fl_ui_menu_begin_impl(menu_id.into().into_sys(), out.as_mut_ptr())"),
+            out.contains(
+                "flowi_sys::fl_ui_menu_begin_impl(menu_id.into().into_sys(), out.as_mut_ptr())"
+            ),
             "c_name keeps _impl; out-param is lifted"
         );
         assert!(
@@ -5123,7 +5153,9 @@ mod tests {
             "begin returns the guard: {out}"
         );
         assert!(
-            out.contains("unsafe { flowi_sys::fl_popup_begin(anchor_id.into().into_sys(), config) };"),
+            out.contains(
+                "unsafe { flowi_sys::fl_popup_begin(anchor_id.into().into_sys(), config) };"
+            ),
             "begin forwards: {out}"
         );
         assert!(
@@ -7013,6 +7045,32 @@ mod tests {
         assert!(
             rustc_compiles(rustc, "nested_only_mirror", &src),
             "a nested-only twin must compile with no unused_unsafe (the wrapper stays off)"
+        );
+    }
+
+    /// A declared `= value` on a bool or numeric field becomes that field's Default;
+    /// fields without one keep the C zero default.
+    #[test]
+    fn mirror_default_uses_declared_field_defaults() {
+        let def = parse_one(
+            "#[attributes(Mirror)]\n\
+             struct TunedConfig { show: bool = true, width: f32 = 200, rows: u32 = 3, gap: f32, }\n\
+             api Popup { open(config: TunedConfig) }",
+            "tuned_config.def",
+        );
+        let mut buf = Vec::new();
+        let sdef = def.structs.iter().find(|s| s.is_mirror()).expect("mirror");
+        RustGen::generate_mirror_struct(&mut buf, sdef).expect("mirror");
+        let mirror = String::from_utf8(buf).unwrap();
+        assert!(mirror.contains("show: true,"), "bool default: {mirror}");
+        assert!(
+            mirror.contains("width: 200.0,"),
+            "float default gains .0: {mirror}"
+        );
+        assert!(mirror.contains("rows: 3,"), "integer default: {mirror}");
+        assert!(
+            mirror.contains("gap: zero.gap,"),
+            "undeclared stays zero: {mirror}"
         );
     }
 
