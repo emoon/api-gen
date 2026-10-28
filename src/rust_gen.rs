@@ -17,6 +17,25 @@ use std::fs::File;
 use std::io;
 use std::io::{BufWriter, Write};
 
+/// The frame-thread check a `#[frame_context]` block's forwarders open with: the Rust path
+/// of the guard function and the block whose forwarders carry it.
+struct FrameGuard<'a> {
+    path: &'a str,
+    block: &'a str,
+}
+
+impl FrameGuard<'_> {
+    /// Emit `let _frame = <path>("<Block>::<method>");`, binding the guard it returns so it
+    /// is held to the end of the forwarder.
+    fn write_statement<W: Write>(&self, f: &mut W, method: &str) -> io::Result<()> {
+        writeln!(
+            f,
+            "        let _frame = {}(\"{}::{}\");",
+            self.path, self.block, method
+        )
+    }
+}
+
 pub struct RustGen;
 
 /// The two safe Rust surfaces over the same loose C symbols. The semantic
@@ -1533,6 +1552,7 @@ impl RustGen {
     /// block's contents, closing brace.
     fn write_facade_method<W: Write>(
         f: &mut W,
+        guard: Option<&FrameGuard>,
         method: &str,
         params: &str,
         ret_ty: Option<&str>,
@@ -1547,6 +1567,9 @@ impl RustGen {
         match ret_ty {
             None => writeln!(f, "    pub fn {}({}) {{", method, params)?,
             Some(ret) => writeln!(f, "    pub fn {}({}) -> {} {{", method, params, ret)?,
+        }
+        if let Some(guard) = guard {
+            guard.write_statement(f, method)?;
         }
         body(f)?;
         writeln!(f, "    }}")
@@ -1831,15 +1854,19 @@ impl RustGen {
     }
 
     /// Emit one façade method for a slot, forwarding to the direct `fl_*` function.
-    fn generate_facade_fn<W: Write>(f: &mut W, func: &Function) -> io::Result<()> {
+    fn generate_facade_fn<W: Write>(
+        f: &mut W,
+        func: &Function,
+        guard: Option<&FrameGuard>,
+    ) -> io::Result<()> {
         if func.is_status {
-            return Self::generate_facade_status_fn(f, func);
+            return Self::generate_facade_status_fn(f, func, guard);
         }
         if func.is_transfer {
-            return Self::generate_facade_transfer_fn(f, func);
+            return Self::generate_facade_transfer_fn(f, func, guard);
         }
         if Self::is_option_shape(func) {
-            return Self::generate_facade_option_fn(f, func);
+            return Self::generate_facade_option_fn(f, func, guard);
         }
         let method = Self::facade_method_name(&func.name);
         let (params, ffi, prelude) = Self::facade_args(func, None, None);
@@ -1857,12 +1884,16 @@ impl RustGen {
         if method == "new" {
             writeln!(f, "    #[allow(clippy::new_ret_no_self)]")?;
         }
-        Self::write_facade_method(f, method, &params, ret_ty.as_deref(), |f| {
+        Self::write_facade_method(f, guard, method, &params, ret_ty.as_deref(), |f| {
             Self::write_unsafe_body(f, &prelude, &tail)
         })
     }
 
-    fn generate_facade_option_fn<W: Write>(f: &mut W, func: &Function) -> io::Result<()> {
+    fn generate_facade_option_fn<W: Write>(
+        f: &mut W,
+        func: &Function,
+        guard: Option<&FrameGuard>,
+    ) -> io::Result<()> {
         let LoweredResult::Option { ty } =
             Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
@@ -1876,6 +1907,7 @@ impl RustGen {
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
+            guard,
             method,
             &params.join(", "),
             Some(&format!("Option<{}>", ty)),
@@ -1897,7 +1929,11 @@ impl RustGen {
         )
     }
 
-    fn generate_facade_transfer_fn<W: Write>(f: &mut W, func: &Function) -> io::Result<()> {
+    fn generate_facade_transfer_fn<W: Write>(
+        f: &mut W,
+        func: &Function,
+        guard: Option<&FrameGuard>,
+    ) -> io::Result<()> {
         let LoweredResult::Transfer { owned_ty } =
             Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
@@ -1908,7 +1944,7 @@ impl RustGen {
         let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
         let method = Self::facade_method_name(&func.name);
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, method, &params.join(", "), Some(&owned_ty), |f| {
+        Self::write_facade_method(f, guard, method, &params.join(", "), Some(&owned_ty), |f| {
             writeln!(f, "        unsafe {{")?;
             for line in &prelude {
                 writeln!(f, "            {}", line)?;
@@ -1923,7 +1959,11 @@ impl RustGen {
     /// the trailing `*mut T` out-param becoming the Ok value (or () when the slot
     /// is status-only). Forwards to the direct `flowi_sys::<c_name>` function and
     /// decodes the returned status code through crate::FlError::from_status.
-    fn generate_facade_status_fn<W: Write>(f: &mut W, func: &Function) -> io::Result<()> {
+    fn generate_facade_status_fn<W: Write>(
+        f: &mut W,
+        func: &Function,
+        guard: Option<&FrameGuard>,
+    ) -> io::Result<()> {
         let LoweredResult::Status { ok_ty, has_out } =
             Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
@@ -1941,7 +1981,7 @@ impl RustGen {
         Self::write_comment(f, &func.doc_comments, 4)?;
         // The slot call (and any `[retained]` prelude) share one unsafe block, then
         // the status decode and Ok-lift stay in safe code so ? reads cleanly.
-        Self::write_facade_method(f, method, &params, Some(&ret_ty), |f| {
+        Self::write_facade_method(f, guard, method, &params, Some(&ret_ty), |f| {
             if has_out {
                 writeln!(
                     f,
@@ -2078,7 +2118,7 @@ impl RustGen {
         };
 
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, method, &params, ret_ty.as_deref(), |f| {
+        Self::write_facade_method(f, None, method, &params, ret_ty.as_deref(), |f| {
             Self::write_unsafe_body(f, &prelude, &tail)
         })
     }
@@ -2103,6 +2143,7 @@ impl RustGen {
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
+            None,
             method,
             &params.join(", "),
             Some(&format!("Result<{}, crate::FlError>", ok_ty)),
@@ -2155,6 +2196,7 @@ impl RustGen {
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
+            None,
             method,
             &params.join(", "),
             Some(&format!("Option<{}>", ty)),
@@ -2193,7 +2235,7 @@ impl RustGen {
         params.insert(0, receiver.to_owned());
         let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, method, &params.join(", "), Some(&owned_ty), |f| {
+        Self::write_facade_method(f, None, method, &params.join(", "), Some(&owned_ty), |f| {
             writeln!(f, "        unsafe {{")?;
             for line in &prelude {
                 writeln!(f, "            {}", line)?;
@@ -2359,7 +2401,8 @@ impl RustGen {
     fn generate_scope_begin_fn<W: Write>(
         f: &mut W,
         func: &Function,
-        guard: &str,
+        scope_ty: &str,
+        guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let method = Self::facade_method_name(&func.name);
         let (params, ffi, prelude) = Self::facade_args(func, None, None);
@@ -2373,9 +2416,9 @@ impl RustGen {
         let call = format!("flowi_sys::{}({})", func.c_name, ffi);
 
         Self::write_comment(f, &func.doc_comments, 4)?;
-        Self::write_facade_method(f, method, &params, Some(guard), |f| {
+        Self::write_facade_method(f, guard, method, &params, Some(scope_ty), |f| {
             writeln!(f, "        unsafe {{ {} }};", call)?;
-            writeln!(f, "        {} {{ _priv: () }}", guard)
+            writeln!(f, "        {} {{ _priv: () }}", scope_ty)
         })
     }
 
@@ -2383,12 +2426,20 @@ impl RustGen {
     /// `<Domain>Scope` token by value and mem::forget it so its Drop does not also
     /// run the end slot, then run the paired end forward exactly once. The end slot
     /// threads no arguments; the scope is thread-local state.
-    fn generate_scope_end_fn<W: Write>(f: &mut W, func: &Function, guard: &str) -> io::Result<()> {
+    fn generate_scope_end_fn<W: Write>(
+        f: &mut W,
+        func: &Function,
+        scope_ty: &str,
+        guard: Option<&FrameGuard>,
+    ) -> io::Result<()> {
         let method = Self::facade_method_name(&func.name);
 
         Self::write_comment(f, &func.doc_comments, 4)?;
         writeln!(f, "    #[inline]")?;
-        writeln!(f, "    pub fn {}(scope: {}) {{", method, guard)?;
+        writeln!(f, "    pub fn {}(scope: {}) {{", method, scope_ty)?;
+        if let Some(guard) = guard {
+            guard.write_statement(f, method)?;
+        }
         writeln!(
             f,
             "        // Consume the guard without running its Drop, then close once: an explicit"
@@ -2414,6 +2465,7 @@ impl RustGen {
         fl_ui_gen_dir: &str,
         api_def: &ApiDef,
         script: &str,
+        frame_guard: Option<&str>,
     ) -> io::Result<bool> {
         // A `#[attributes(service)]` block has no direct-link façade: the
         // external-consumer wrapper pass owns that surface.
@@ -2472,7 +2524,18 @@ impl RustGen {
                     write!(f, "{}", owned)?;
                 }
             }
+            let guard = frame_guard
+                .filter(|_| api.is_frame_context)
+                .map(|path| FrameGuard {
+                    path,
+                    block: &api.name,
+                });
             if let Some(drop_fn) = Self::api_drop_fn(api) {
+                assert!(
+                    guard.is_none(),
+                    "api_gen: façade `{}`: #[frame_context] is not supported on a block with a [drop] slot",
+                    api.name
+                );
                 Self::generate_raii_facade(f, api, drop_fn)?;
                 continue;
             }
@@ -2500,11 +2563,21 @@ impl RustGen {
                 }
                 first = false;
                 if scope.is_some() && func.is_scope_begin {
-                    Self::generate_scope_begin_fn(f, func, &Self::scope_guard_name(api))?;
+                    Self::generate_scope_begin_fn(
+                        f,
+                        func,
+                        &Self::scope_guard_name(api),
+                        guard.as_ref(),
+                    )?;
                 } else if scope.is_some() && func.is_scope_end {
-                    Self::generate_scope_end_fn(f, func, &Self::scope_guard_name(api))?;
+                    Self::generate_scope_end_fn(
+                        f,
+                        func,
+                        &Self::scope_guard_name(api),
+                        guard.as_ref(),
+                    )?;
                 } else {
-                    Self::generate_facade_fn(f, func)?;
+                    Self::generate_facade_fn(f, func, guard.as_ref())?;
                 }
             }
             writeln!(f, "}}")?;
@@ -3588,6 +3661,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A `#[frame_context]` block opens every forwarder shape - plain, status, option,
+    /// transfer, scope begin and scope end - with the configured guard call, named for the
+    /// block and the public method; an unmarked block, and a marked block with no
+    /// configured path, emit none.
+    #[test]
+    fn frame_context_block_opens_each_forwarder_with_the_guard() {
+        let src = |attr: &str| {
+            format!(
+                "struct Owned {{ x: u32 }}\n\
+                 {attr} api Gadget {{\n\
+                     poke(x: u32)\n\
+                     [status] parse(base: u64, out: *u64) -> i32\n\
+                     try_peek(key: u64, out: *u32) -> bool\n\
+                     [scope_begin] begin(id: u32)\n\
+                     [scope_end] end()\n\
+                 }}"
+            )
+        };
+        let emit = |attr: &str, path: Option<&str>| {
+            let dir = std::env::temp_dir().join(format!(
+                "api_gen_frame_{}_{}",
+                std::process::id(),
+                std::thread::current()
+                    .name()
+                    .unwrap_or("t")
+                    .replace("::", "_")
+            ));
+            std::fs::create_dir_all(&dir).expect("mk dir");
+            let def = parse_one(&src(attr), "gadget.def");
+            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", path)
+                .expect("facade");
+            std::fs::read_to_string(dir.join("gadget.rs")).expect("read facade")
+        };
+        let path = Some("crate::frame_thread::frame_thread_guard");
+
+        let guarded = emit("#[frame_context]", path);
+        for method in ["poke", "parse", "try_peek", "begin", "end"] {
+            let line = format!(
+                "let _frame = crate::frame_thread::frame_thread_guard(\"Gadget::{method}\");"
+            );
+            assert!(guarded.contains(&line), "{method} is guarded: {guarded}");
+        }
+        assert_eq!(guarded.matches("let _frame").count(), 5);
+        // The guard is the method's first statement, ahead of the unsafe call.
+        let body = guarded.split("pub fn poke").nth(1).expect("poke");
+        assert!(
+            body.find("let _frame").unwrap() < body.find("unsafe").unwrap(),
+            "guard precedes the call: {guarded}"
+        );
+
+        assert!(!emit("", path).contains("_frame"), "unmarked block");
+        assert!(
+            !emit("#[frame_context]", None).contains("_frame"),
+            "no path"
+        );
+    }
+
+    /// `#[frame_context]` combines with `#[attributes(...)]` in either order.
+    #[test]
+    fn frame_context_parses_beside_attributes() {
+        for attrs in [
+            "#[frame_context] #[attributes(thread_safe)]",
+            "#[attributes(thread_safe)] #[frame_context]",
+        ] {
+            let def = parse_one(&format!("{attrs} api Gadget {{ poke() }}"), "gadget.def");
+            assert!(def.apis[0].is_frame_context, "{attrs}");
+        }
+        let plain = parse_one("api Gadget { poke() }", "gadget.def");
+        assert!(!plain.apis[0].is_frame_context);
+    }
+
     /// A `[retained]` slot's façade copies its `*const T` arg into wrapper-owned static
     /// storage and passes C a pointer to that copy - so a safe caller may pass a stack
     /// temporary - while keeping the &T signature.
@@ -3604,7 +3748,7 @@ mod tests {
             "theme.def",
         );
         assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &api_def, "scripts/gen.sh")
+            RustGen::generate_facade(dir.to_str().unwrap(), &api_def, "scripts/gen.sh", None)
                 .expect("facade")
         );
         let out = std::fs::read_to_string(dir.join("theme.rs")).expect("read facade");
@@ -4487,7 +4631,7 @@ mod tests {
                 .iter()
                 .filter(|f| RustGen::facade_generates(f))
             {
-                RustGen::generate_facade_fn(&mut buf, func).unwrap();
+                RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
             }
             writeln!(buf, "}}").unwrap();
         }
@@ -4589,7 +4733,7 @@ mod tests {
                 .iter()
                 .filter(|f| RustGen::facade_generates(f))
             {
-                RustGen::generate_facade_fn(&mut buf, func).unwrap();
+                RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
             }
         }
         let out = String::from_utf8(buf).unwrap();
@@ -4622,7 +4766,7 @@ mod tests {
             .find(|f| f.name == "probe")
             .unwrap();
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, probe).unwrap();
+        RustGen::generate_facade_fn(&mut buf, probe, None).unwrap();
     }
 
     /// A `[status]` slot maps to `Result<T, crate::FlError>` in the direct-link façade:
@@ -4645,7 +4789,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut buf, func).unwrap();
+            RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
 
@@ -4708,7 +4852,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut fbuf, func).unwrap();
+            RustGen::generate_facade_fn(&mut fbuf, func, None).unwrap();
         }
         let fout = String::from_utf8(fbuf).unwrap();
         assert!(
@@ -4788,7 +4932,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut sbuf, func).unwrap();
+            RustGen::generate_facade_fn(&mut sbuf, func, None).unwrap();
         }
         let sout = String::from_utf8(sbuf).unwrap();
         assert!(
@@ -4859,7 +5003,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut buf, func).unwrap();
+            RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
         assert!(
@@ -5121,11 +5265,11 @@ mod tests {
             .filter(|f| RustGen::facade_generates(f))
         {
             if func.is_scope_begin {
-                RustGen::generate_scope_begin_fn(&mut buf, func, &guard).unwrap();
+                RustGen::generate_scope_begin_fn(&mut buf, func, &guard, None).unwrap();
             } else if func.is_scope_end {
-                RustGen::generate_scope_end_fn(&mut buf, func, &guard).unwrap();
+                RustGen::generate_scope_end_fn(&mut buf, func, &guard, None).unwrap();
             } else {
-                RustGen::generate_facade_fn(&mut buf, func).unwrap();
+                RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
             }
         }
         writeln!(buf, "}}").unwrap();
@@ -5351,7 +5495,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("api_gen_direct_loose_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create façade dir");
         assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh")
+            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", None)
                 .expect("generate façade")
         );
         let out = std::fs::read_to_string(dir.join("gadget.rs")).expect("read façade");
@@ -5400,7 +5544,7 @@ mod tests {
     fn status_decode_casts_only_a_non_i32_status() {
         let i32_status = parse_one("api Store { [status] flush() -> i32 }", "store_i32.def");
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &i32_status.apis[0].functions[0]).unwrap();
+        RustGen::generate_facade_fn(&mut buf, &i32_status.apis[0].functions[0], None).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("from_status(status)?;") && !out.contains("status as i32"),
@@ -5409,7 +5553,7 @@ mod tests {
 
         let wide_status = parse_one("api Store { [status] flush() -> i64 }", "store_i64.def");
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &wide_status.apis[0].functions[0]).unwrap();
+        RustGen::generate_facade_fn(&mut buf, &wide_status.apis[0].functions[0], None).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("from_status(status as i32)?;"), "{out}");
     }
@@ -5434,12 +5578,12 @@ mod tests {
             "painter_arity.def",
         );
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0]).unwrap();
+        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).unwrap();
         assert!(String::from_utf8(buf)
             .unwrap()
             .contains("#[allow(clippy::too_many_arguments)]"));
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[1]).unwrap();
+        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[1], None).unwrap();
         assert!(!String::from_utf8(buf)
             .unwrap()
             .contains("too_many_arguments"));
@@ -5475,7 +5619,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("api_gen_safety_hdr_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create façade dir");
         assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh")
+            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", None)
                 .expect("generate façade")
         );
         let out = std::fs::read_to_string(dir.join("cursor.rs")).expect("read façade");
@@ -5506,7 +5650,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("api_gen_raii_loose_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create façade dir");
         assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh")
+            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", None)
                 .expect("generate façade")
         );
         let out = std::fs::read_to_string(dir.join("store.rs")).expect("read façade");
@@ -6819,7 +6963,7 @@ mod tests {
 
         let mut buf = Vec::new();
         let func = &def.apis[0].functions[0];
-        RustGen::generate_facade_fn(&mut buf, func).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, func, None).expect("facade");
         let facade = String::from_utf8(buf).unwrap();
 
         assert!(
@@ -6916,7 +7060,7 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0]).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).expect("facade");
         let facade = String::from_utf8(buf).unwrap();
         assert!(
             !facade.contains("flowi_sys::DropdownConfig")
@@ -7011,7 +7155,7 @@ mod tests {
         }
         let mirror = String::from_utf8(buf).unwrap();
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0]).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).expect("facade");
         let facade = String::from_utf8(buf).unwrap();
 
         let Some(rustc) = find_rustc() else {
@@ -7105,7 +7249,7 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0]).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).expect("facade");
         let facade = String::from_utf8(buf).unwrap();
         assert!(
             facade.contains("pub fn open(config: crate::generated::plain_config::PlainConfig)"),

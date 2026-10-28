@@ -342,6 +342,10 @@ pub struct Api {
     /// => the wrapper is !Send + !Sync unless every generated slot is individually
     /// `[thread_safe]`.
     pub is_thread_safe: bool,
+    /// `#[frame_context]`: every façade forwarder in this block reaches the global C UI
+    /// context, so each opens with the configured frame guard
+    /// (`Config::facade_frame_guard`). false => the forwarders are unchecked.
+    pub is_frame_context: bool,
 }
 
 /// A `callback <Name>(args) -> ret` construct: a named C function-pointer typedef
@@ -1127,6 +1131,7 @@ impl ApiParser {
                     api.is_service = attrs.iter().any(|a| a == "service");
                     api.is_thread_safe = attrs.iter().any(|a| a == "thread_safe");
                 }
+                Rule::frame_context_attr => api.is_frame_context = true,
                 Rule::apifnlist => api.functions = Self::fill_api_fn_list(entry),
                 _ => (),
             }

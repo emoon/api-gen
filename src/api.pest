@@ -95,7 +95,10 @@ callbackdef = { ("callback") ~ name ~ ("(") ~ varlist? ~ (")") ~ retexp? }
 // functions (no `self` receiver) bound to hand-written `fl_<domain>_<fn>` bodies.
 // `#[attributes(service)]` marks foundation services whose slot names are already
 // the exported C symbol names and which can opt into the Rust service wrapper.
-apidef    = { attributes* ~ ("api") ~ name ~ ("{") ~ apifnlist? ~ ("}") }
+apidef    = { (attributes | frame_context_attr)* ~ ("api") ~ name ~ ("{") ~ apifnlist? ~ ("}") }
+// `#[frame_context]` marks a block whose forwarders read or write the global frame
+// context; the Rust façade opens each with the configured frame guard.
+frame_context_attr = { ("#[frame_context]") }
 apifnlist = { (doc_comment | apifn)* }
 
 // Per-slot markers, in any combination. `[manual]` keeps the slot's

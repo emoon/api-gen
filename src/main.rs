@@ -12,6 +12,7 @@ fn main() {
     let mut rust_dir = None;
     let mut c_include_root = None;
     let mut facade_dir = None;
+    let mut facade_frame_guard = None;
     let mut service_wrapper_dir = None;
     let mut service_wrapper_raw_path = None;
     let mut c_include_prefix = None;
@@ -53,6 +54,7 @@ fn main() {
             "--rust-dir" => rust_dir = Some(PathBuf::from(val())),
             "--c-include-root" => c_include_root = Some(PathBuf::from(val())),
             "--facade-dir" => facade_dir = Some(PathBuf::from(val())),
+            "--facade-frame-guard" => facade_frame_guard = Some(val()),
             "--service-wrapper-dir" => service_wrapper_dir = Some(PathBuf::from(val())),
             "--service-wrapper-raw-path" => service_wrapper_raw_path = Some(val()),
             "--c-include-prefix" => c_include_prefix = Some(val()),
@@ -97,6 +99,7 @@ fn main() {
         rust_dir,
         c_include_root,
         facade_dir,
+        facade_frame_guard,
         service_wrapper_dir,
         service_wrapper_raw_path,
         c_include_prefix,

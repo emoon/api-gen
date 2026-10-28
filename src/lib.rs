@@ -131,6 +131,11 @@ pub struct Config {
     pub c_include_root: Option<PathBuf>,
     /// Ergonomic Rust façade output dir. None skips façade generation.
     pub facade_dir: Option<PathBuf>,
+    /// Rust path of the guard function (`crate::frame_thread::frame_thread_guard`) every façade
+    /// forwarder of a `#[frame_context]` api block calls first, as
+    /// `let _frame = <path>("<Block>::<fn>");`. It takes the entry-point name and returns a
+    /// guard held across the C call. None emits no check even in a `#[frame_context]` block.
+    pub facade_frame_guard: Option<String>,
     /// Output dir for the generated service-consume wrapper crate: one
     /// `<def>.rs` module per `#[attributes(service)]` def plus a mod.rs index.
     /// None skips wrapper generation.
@@ -458,7 +463,13 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
             }
         }
         if let Some(facade) = &cfg.facade_dir {
-            if RustGen::generate_facade(utf8(facade)?, api_def, gen_script(cfg)).map_err(io(
+            if RustGen::generate_facade(
+                utf8(facade)?,
+                api_def,
+                gen_script(cfg),
+                cfg.facade_frame_guard.as_deref(),
+            )
+            .map_err(io(
                 &format!("writing the façade for {} into", api_def.base_filename),
                 facade,
             ))? {
@@ -658,6 +669,7 @@ mod tests {
             rust_dir: None,
             c_include_root: None,
             facade_dir: None,
+            facade_frame_guard: None,
             service_wrapper_dir: Some(wrapper_dir.clone()),
             service_wrapper_raw_path: None,
             c_include_prefix: None,
