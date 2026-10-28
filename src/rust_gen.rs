@@ -1732,12 +1732,12 @@ impl RustGen {
         writeln!(f, "    fn default() -> Self {{")?;
         writeln!(
             f,
-            "        // The C zero default ((Fl{}){{0}}): empty strings, no optional pointers, and",
+            "        // Each field takes the default its .def declares, else the C zero default ((Fl{}){{0}}): empty",
             sdef.name
         )?;
         writeln!(
             f,
-            "        // every remaining field zero - including each nested config, whose own Default is"
+            "        // strings, no optional pointers, and zero scalars - including each nested config, whose own Default is"
         )?;
         writeln!(f, "        // that struct's C zero default.")?;
         if needs_zero {
