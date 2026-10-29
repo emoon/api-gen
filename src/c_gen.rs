@@ -770,7 +770,6 @@ impl Cgen {
     /// get their lowercase convenience macro.
     fn generate_api_decls<W: Write>(f: &mut W, api: &Api, naming: &Naming) -> io::Result<()> {
         Self::write_comment(f, &api.doc_comments, 0)?;
-        writeln!(f, "// Direct API - hand-written bodies.")?;
         for func in &api.functions {
             Self::write_comment(f, &func.doc_comments, 0)?;
             writeln!(
