@@ -2366,7 +2366,7 @@ impl RustGen {
     // owned handle - the scope is state on the global UI context - so the ergonomic
     // binding is a zero-sized `<Domain>Scope` guard returned by the begin method,
     // whose Drop runs the paired end slot. The end slot is emitted as an explicit
-    // close that consumes the guard by value (and mem::forgets it), so a double
+    // close that consumes the guard by value (and drops it), so a double
     // close is a compile error rather than a runtime double end.
 
     /// The `[scope_begin]` slot of an api block, if any.
@@ -2394,6 +2394,7 @@ impl RustGen {
         api: &Api,
         begin_fn: &Function,
         end_fn: &Function,
+        frame_guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let guard = Self::scope_guard_name(api);
         let begin = Self::facade_method_name(&begin_fn.name);
@@ -2443,6 +2444,9 @@ impl RustGen {
 
         writeln!(f, "impl Drop for {} {{", guard)?;
         writeln!(f, "    fn drop(&mut self) {{")?;
+        if let Some(frame_guard) = frame_guard {
+            frame_guard.write_statement(f, end)?;
+        }
         writeln!(f, "        unsafe {{ flowi_sys::{}() }};", end_fn.c_name)?;
         writeln!(f, "    }}")?;
         writeln!(f, "}}")?;
@@ -2478,34 +2482,20 @@ impl RustGen {
     }
 
     /// Emit the `[scope_end]` slot as a guard-consuming method: take the
-    /// `<Domain>Scope` token by value and mem::forget it so its Drop does not also
-    /// run the end slot, then run the paired end forward exactly once. The end slot
-    /// threads no arguments; the scope is thread-local state.
+    /// `<Domain>Scope` token by value and drop it, so the close runs through the
+    /// guard's Drop exactly once - and takes the frame-thread guard exactly once,
+    /// there. The end slot threads no arguments; the scope is thread-local state.
     fn generate_scope_end_fn<W: Write>(
         f: &mut W,
         func: &Function,
         scope_ty: &str,
-        guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let method = Self::facade_method_name(&func.name);
 
         Self::write_comment(f, &func.doc_comments, 4)?;
         writeln!(f, "    #[inline]")?;
         writeln!(f, "    pub fn {}(scope: {}) {{", method, scope_ty)?;
-        if let Some(guard) = guard {
-            guard.write_statement(f, method)?;
-        }
-        writeln!(
-            f,
-            "        // Consume the guard without running its Drop, then close once: an explicit"
-        )?;
-        writeln!(
-            f,
-            "        // {method} plus the guard's drop (or two {method} calls) is a compile error, not a"
-        )?;
-        writeln!(f, "        // runtime double close.")?;
-        writeln!(f, "        core::mem::forget(scope);")?;
-        writeln!(f, "        unsafe {{ flowi_sys::{}() }}", func.c_name)?;
+        writeln!(f, "        drop(scope);")?;
         writeln!(f, "    }}")?;
         Ok(())
     }
@@ -2607,7 +2597,7 @@ impl RustGen {
             // guard-returning method instead of a bare void forwarder.
             let scope = Self::api_scope_begin_fn(api).zip(Self::api_scope_end_fn(api));
             if let Some((begin_fn, end_fn)) = scope {
-                Self::generate_scope_guard(f, api, begin_fn, end_fn)?;
+                Self::generate_scope_guard(f, api, begin_fn, end_fn, slot_guard(end_fn))?;
             }
 
             Self::write_comment(f, &api.doc_comments, 0)?;
@@ -2630,12 +2620,7 @@ impl RustGen {
                         slot_guard(func),
                     )?;
                 } else if scope.is_some() && func.is_scope_end {
-                    Self::generate_scope_end_fn(
-                        f,
-                        func,
-                        &Self::scope_guard_name(api),
-                        slot_guard(func),
-                    )?;
+                    Self::generate_scope_end_fn(f, func, &Self::scope_guard_name(api))?;
                 } else {
                     Self::generate_facade_fn(f, func, slot_guard(func))?;
                 }
@@ -5397,7 +5382,7 @@ mod tests {
         let mut buf = Vec::new();
         let begin_fn = RustGen::api_scope_begin_fn(api).expect("scope_begin slot");
         let end_fn = RustGen::api_scope_end_fn(api).expect("scope_end slot");
-        RustGen::generate_scope_guard(&mut buf, api, begin_fn, end_fn).expect("guard");
+        RustGen::generate_scope_guard(&mut buf, api, begin_fn, end_fn, None).expect("guard");
         let guard = RustGen::scope_guard_name(api);
         writeln!(buf, "pub struct {};", api.name).unwrap();
         writeln!(buf, "impl {} {{", api.name).unwrap();
@@ -5409,7 +5394,7 @@ mod tests {
             if func.is_scope_begin {
                 RustGen::generate_scope_begin_fn(&mut buf, func, &guard, None).unwrap();
             } else if func.is_scope_end {
-                RustGen::generate_scope_end_fn(&mut buf, func, &guard, None).unwrap();
+                RustGen::generate_scope_end_fn(&mut buf, func, &guard).unwrap();
             } else {
                 RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
             }
@@ -5451,8 +5436,8 @@ mod tests {
             "end consumes the guard: {out}"
         );
         assert!(
-            out.contains("core::mem::forget(scope);"),
-            "end mem::forgets the guard so Drop does not double-close: {out}"
+            out.contains("pub fn end(scope: PopupScope) {\n        drop(scope);"),
+            "end closes through the guard's Drop: {out}"
         );
         assert!(
             out.contains(
@@ -5505,6 +5490,43 @@ mod tests {
         assert!(
             !rustc_compiles(rustc, "scope_double_close", &double_close),
             "closing a consumed scope guard twice must be a compile error, not a runtime double end"
+        );
+    }
+
+    /// With a frame guard, the scope token's Drop takes the guard before the end call, and
+    /// the explicit end does not take it a second time (it closes through that Drop).
+    #[test]
+    fn scope_guard_drop_takes_the_frame_thread_guard_once() {
+        let api_def = parse_one(
+            "api Popup {\n\
+                 [scope_begin] begin(anchor_id: LayoutId)\n\
+                 [scope_end] end()\n\
+             }",
+            "popup.def",
+        );
+        let api = &api_def.apis[0];
+        let begin_fn = RustGen::api_scope_begin_fn(api).expect("scope_begin slot");
+        let end_fn = RustGen::api_scope_end_fn(api).expect("scope_end slot");
+        let frame_guard = FrameGuard {
+            path: "crate::frame_thread::frame_thread_guard",
+            block: &api.name,
+        };
+        let mut buf = Vec::new();
+        RustGen::generate_scope_guard(&mut buf, api, begin_fn, end_fn, Some(&frame_guard))
+            .expect("guard");
+        RustGen::generate_scope_end_fn(&mut buf, end_fn, "PopupScope").unwrap();
+        let out = String::from_utf8(buf).unwrap();
+
+        assert!(
+            out.contains(
+                "fn drop(&mut self) {\n        let _frame = crate::frame_thread::frame_thread_guard(\"Popup::end\");\n        unsafe { flowi_sys::fl_popup_end() };"
+            ),
+            "Drop takes the guard before closing: {out}"
+        );
+        assert_eq!(
+            out.matches("frame_thread_guard(").count(),
+            1,
+            "the explicit end must not take the guard again: {out}"
         );
     }
 
