@@ -1000,15 +1000,15 @@ fn callback_values(api_def: &ApiDef) -> impl Iterator<Item = &Variable> {
         .flat_map(|cb| cb.function_args.iter().chain(cb.return_val.iter()))
 }
 
-/// Suffixes of the by-value struct types a designated-initializer convenience macro
-/// builds: option bags a caller fills field by field. Handles, ids, colors, events
+/// Suffix of the by-value struct types a designated-initializer convenience macro
+/// builds: config bags a caller fills field by field. Handles, ids, colors, events
 /// and other whole values are passed as plain expressions and never wrapped.
-const CONFIG_TYPE_SUFFIXES: [&str; 3] = ["Config", "Opts", "Options"];
+const CONFIG_TYPE_SUFFIX: &str = "Config";
 
 /// The trailing by-value config struct of an api slot, if any - the arg a
 /// designated-initializer convenience macro builds from __VA_ARGS__. It is the
-/// last non-self arg and must be a by-value generated struct named *Config,
-/// *Opts or *Options: VariableType::Regular, not a pointer, and not an array. A
+/// last non-self arg and must be a by-value generated struct named *Config:
+/// VariableType::Regular, not a pointer, and not an array. A
 /// `callback <Name>` arg is a named type too but a function-pointer typedef, not
 /// designated-initializable, so it is excluded explicitly via is_callback.
 fn convenience_config_arg(func: &Function) -> Option<&Variable> {
@@ -1022,9 +1022,7 @@ fn convenience_config_arg(func: &Function) -> Option<&Variable> {
         && !last.pointer
         && !last.const_pointer
         && last.array.is_none();
-    let config_named = CONFIG_TYPE_SUFFIXES
-        .iter()
-        .any(|suffix| last.type_name.ends_with(suffix));
+    let config_named = last.type_name.ends_with(CONFIG_TYPE_SUFFIX);
     (by_value_struct && config_named).then_some(last)
 }
 
@@ -2231,8 +2229,8 @@ mod tests {
     fn non_trailing_callback_keeps_config_macro() {
         let api_def = parse_one(
             "callback FrameFn(user_data: *void)\n\
-             struct Opts { flags: u32 }\n\
-             api Runner { on(frame: FrameFn, opts: Opts) }",
+             struct Config { flags: u32 }\n\
+             api Runner { on(frame: FrameFn, opts: Config) }",
             "runner.def",
         );
 
@@ -2255,7 +2253,7 @@ mod tests {
         let out = String::from_utf8(buf).expect("utf8");
         assert!(
             out.contains(
-                "#define fl_runner_on(frame, ...) fl_runner_on(frame, (FlOpts) { __VA_ARGS__ })"
+                "#define fl_runner_on(frame, ...) fl_runner_on(frame, (FlConfig) { __VA_ARGS__ })"
             ),
             "direct convenience wrapper stays lowercase: {out}"
         );
@@ -2367,8 +2365,8 @@ mod tests {
             "a plain value struct is passed as an expression: {out}"
         );
         assert!(
-            out.contains("#define fl_painter_styled(x, ...) fl_painter_styled(x, (FlDrawOpts) { __VA_ARGS__ })"),
-            "an *Opts struct keeps its designated-init macro: {out}"
+            !out.contains("#define fl_painter_styled("),
+            "an *Opts struct is passed as an expression: {out}"
         );
     }
 
