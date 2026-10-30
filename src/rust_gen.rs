@@ -42,9 +42,16 @@ pub struct RustGen;
 /// classification is shared; this selects only crate-local spelling/policy
 /// (for example, which string helper owns the bytes for the call).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-enum LooseSymbolSurface {
-    DirectLink,
+enum LooseSymbolSurface<'a> {
+    /// The façade: names the raw bindings through the given Rust path.
+    DirectLink(&'a str),
     ExternalConsumer,
+}
+
+impl LooseSymbolSurface<'_> {
+    fn is_direct_link(self) -> bool {
+        matches!(self, LooseSymbolSurface::DirectLink(_))
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -118,14 +125,14 @@ impl RustGen {
     /// Crate path a surface reaches the generated ABI types through: the direct-link
     /// façade names them flowi_sys::; an external consumer carries its own copy of
     /// the defs and may not depend on flowi_sys at all, so it names them crate::.
-    fn loose_symbol_crate_root(surface: LooseSymbolSurface) -> &'static str {
+    fn loose_symbol_crate_root<'a>(surface: LooseSymbolSurface<'a>) -> &'a str {
         match surface {
-            LooseSymbolSurface::DirectLink => "flowi_sys",
+            LooseSymbolSurface::DirectLink(raw) => raw,
             LooseSymbolSurface::ExternalConsumer => "crate",
         }
     }
 
-    fn loose_symbol_base_type(surface: LooseSymbolSurface, var: &Variable) -> String {
+    fn loose_symbol_base_type(surface: LooseSymbolSurface<'_>, var: &Variable) -> String {
         // An extern opaque dep is declared module-locally, so it is referenced
         // unqualified on either surface.
         if var.is_extern_opaque {
@@ -146,10 +153,10 @@ impl RustGen {
     ///
     /// The emitted expression calls an unsafe extern "C" function, so every caller
     /// must place it inside an unsafe block.
-    fn arena_str_expr(expr: &str) -> String {
+    fn arena_str_expr(raw: &str, expr: &str) -> String {
         format!(
-            "{{ let s = {}; flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }}",
-            expr
+            "{{ let s = {}; {}::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()) }}",
+            expr, raw
         )
     }
 
@@ -157,21 +164,23 @@ impl RustGen {
     /// copies into the per-frame arena (inline fl_frame_str) unless the slot is
     /// `[borrowed]` (the callee copies before returning, so the caller's bytes can be
     /// pointed at directly); an external consumer has no frame arena and always borrows.
-    fn lower_string_arg(surface: LooseSymbolSurface, func: &Function, expr: &str) -> String {
+    fn lower_string_arg(surface: LooseSymbolSurface<'_>, func: &Function, expr: &str) -> String {
         match surface {
-            LooseSymbolSurface::DirectLink if !func.is_borrowed => Self::arena_str_expr(expr),
-            LooseSymbolSurface::DirectLink => format!("flowi_sys::RawStr::borrow({})", expr),
+            LooseSymbolSurface::DirectLink(raw) if !func.is_borrowed => {
+                Self::arena_str_expr(raw, expr)
+            }
+            LooseSymbolSurface::DirectLink(raw) => format!("{}::RawStr::borrow({})", raw, expr),
             LooseSymbolSurface::ExternalConsumer => format!("crate::RawStr::borrow({})", expr),
         }
     }
 
     fn lower_loose_symbol_arg(
-        surface: LooseSymbolSurface,
+        surface: LooseSymbolSurface<'_>,
         func: &Function,
         arg: &Variable,
     ) -> Result<(Option<String>, String, Vec<String>), String> {
         let name = Self::rust_ident(&arg.name);
-        if surface == LooseSymbolSurface::DirectLink
+        if surface.is_direct_link()
             && arg.type_name == "LayoutId"
             && arg.vtype == VariableType::Regular
         {
@@ -225,7 +234,7 @@ impl RustGen {
         // to_sys packs - copying each string into the per-frame arena - at the call.
         // The arena is a façade-only resource, so an external consumer keeps the raw
         // ABI struct.
-        if surface == LooseSymbolSurface::DirectLink && !arg.pointer && !arg.const_pointer {
+        if surface.is_direct_link() && !arg.pointer && !arg.const_pointer {
             if let Some(mirror) = &arg.mirror {
                 return Ok((
                     Some(format!(
@@ -269,7 +278,7 @@ impl RustGen {
         }
         let base = Self::loose_symbol_base_type(surface, arg);
         if arg.const_pointer {
-            if func.is_retained && surface == LooseSymbolSurface::DirectLink {
+            if func.is_retained && surface.is_direct_link() {
                 let slot = format!("RETAINED_{}", arg.name.to_uppercase());
                 let prelude = vec![
                     format!(
@@ -309,7 +318,7 @@ impl RustGen {
     }
 
     fn lower_loose_symbol_args(
-        surface: LooseSymbolSurface,
+        surface: LooseSymbolSurface<'_>,
         func: &Function,
         handle: Option<&str>,
         out_idx: Option<usize>,
@@ -403,7 +412,7 @@ impl RustGen {
                     }
                     // The frame arena is a façade-only resource: an external consumer has no live
                     // frame to allocate from, and a `[borrowed]` slot's whole point is not copying.
-                    if surface != LooseSymbolSurface::DirectLink || func.is_borrowed {
+                    if !surface.is_direct_link() || func.is_borrowed {
                         return Err(format!(
                             "slot `{}`: string array `{}` needs the frame arena, which only the \
                              ordinary façade surface has (not `[borrowed]`, not an external \
@@ -417,13 +426,17 @@ impl RustGen {
                         "let {name}: Vec<&str> = {name}.iter().map(|s| s.as_ref()).collect();"
                     ));
                     lowered.prelude.push(format!(
-                        "let {} = flowi_sys::fl_frame_str_array({}.len() as u32);",
-                        packed, name
+                        "let {} = {}::fl_frame_str_array({}.len() as u32);",
+                        packed,
+                        Self::loose_symbol_crate_root(surface),
+                        name
                     ));
                     lowered.prelude.push(format!(
                         "for (i, s) in {}.iter().enumerate() {{ *{}.add(i) = \
-                         flowi_sys::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()); }}",
-                        name, packed
+                         {}::fl_frame_str(s.as_ptr() as *const core::ffi::c_char, s.len()); }}",
+                        name,
+                        packed,
+                        Self::loose_symbol_crate_root(surface)
                     ));
                     lowered.ffi.push(packed);
                     lowered.ffi.push(format!("{}.len() as u32", name));
@@ -442,7 +455,7 @@ impl RustGen {
                 i += 1;
                 continue;
             }
-            if surface == LooseSymbolSurface::DirectLink {
+            if surface.is_direct_link() {
                 let name = Self::rust_ident(&arg.name);
                 if arg.vtype == VariableType::Str && !arg.is_extern_opaque && !arg.is_transfer {
                     lowered.params.push(format!("{}: impl AsRef<str>", name));
@@ -481,7 +494,7 @@ impl RustGen {
     /// the same text. Every other classification names a generated type, which the two
     /// surfaces reach through different crate roots.
     fn lower_loose_symbol_result(
-        surface: LooseSymbolSurface,
+        surface: LooseSymbolSurface<'_>,
         func: &Function,
     ) -> Result<LoweredResult, String> {
         // Both out-param shapes below read their buffer back BY VALUE, through
@@ -549,7 +562,7 @@ impl RustGen {
             // wrapper's &self anchors its lifetime. Only the service wrapper has a
             // receiver - the stateless façade would let a caller infer 'static, so
             // there the return falls back to the owned copy below.
-            if func.is_borrowed && surface != LooseSymbolSurface::DirectLink {
+            if func.is_borrowed && !surface.is_direct_link() {
                 return Ok(LoweredResult::Value {
                     ty: "&str".to_owned(),
                     wrap: Some("ret.as_str()".to_owned()),
@@ -599,16 +612,16 @@ impl RustGen {
     /// -> c_char, the rest straight), and every other named type - including an
     /// opaque handle - is its unprefixed IDL name through the crate root
     /// (crate::Color).
-    fn rust_base_type(var: &Variable) -> String {
+    fn rust_base_type(root: &str, var: &Variable) -> String {
         // An extern opaque dep is a module-local uninhabited ZST named by its
         // verbatim external C type (UiCtx, FlArena) - never crate::-qualified.
         if var.is_extern_opaque {
             return var.type_name.clone();
         }
         match var.vtype {
-            VariableType::Str => "crate::RawStr".to_owned(),
+            VariableType::Str => format!("{root}::RawStr"),
             VariableType::Primitive => Self::ffi_primitive(&var.type_name),
-            _ => format!("crate::{}", var.type_name),
+            _ => format!("{root}::{}", var.type_name),
         }
     }
 
@@ -637,8 +650,8 @@ impl RustGen {
     /// Rust spelling of any value - a struct field, union variant, method arg, or
     /// return - as the base type plus any pointer qualifier. A union field is
     /// special-cased by its caller, which names the generated union type instead.
-    fn rust_field_type(var: &Variable) -> String {
-        let base = Self::apply_pointer(var, Self::rust_base_type(var));
+    fn rust_field_type(root: &str, var: &Variable) -> String {
+        let base = Self::apply_pointer(var, Self::rust_base_type(root, var));
         match &var.array {
             // Unsized arrays are pointer+length args handled by the signature path.
             Some(ArrayType::SizedArray(n)) => format!("[{}; {}]", base, n),
@@ -704,6 +717,7 @@ impl RustGen {
     /// assertion, preceded by a named union type for each anonymous-union field.
     fn generate_data_struct<W: Write>(
         f: &mut W,
+        root: &str,
         sdef: &Struct,
         reg: &TypeRegistry,
     ) -> io::Result<()> {
@@ -715,7 +729,7 @@ impl RustGen {
         // guard) before the struct that embeds it.
         for var in &sdef.variables {
             if let Some(variants) = &var.union_variants {
-                Self::generate_union(f, name, var, variants, reg)?;
+                Self::generate_union(f, root, name, var, variants, reg)?;
             }
         }
 
@@ -756,14 +770,17 @@ impl RustGen {
                     let (fname, ty) = if var.union_variants.is_some() {
                         Self::union_field_spelling(name, var)
                     } else {
-                        (Self::rust_ident(&var.name), Self::rust_field_type(var))
+                        (
+                            Self::rust_ident(&var.name),
+                            Self::rust_field_type(root, var),
+                        )
                     };
                     writeln!(f, "    pub {}: {},", fname, ty)?;
                 }
                 FieldRef::Func(i) => {
                     let func = &sdef.functions[i];
                     Self::write_comment(f, &func.doc_comments, 4)?;
-                    let (params, ret) = Self::rust_signature(func);
+                    let (params, ret) = Self::rust_signature(root, func);
                     writeln!(
                         f,
                         "    pub {}: Option<unsafe extern \"C\" fn({}){}>,",
@@ -785,6 +802,7 @@ impl RustGen {
     /// size/align assertion pinning its IDL-computed layout.
     fn generate_union<W: Write>(
         f: &mut W,
+        root: &str,
         struct_name: &str,
         field: &Variable,
         variants: &[Variable],
@@ -803,7 +821,7 @@ impl RustGen {
                 f,
                 "    pub {}: {},",
                 Self::rust_ident(&variant.name),
-                Self::rust_field_type(variant)
+                Self::rust_field_type(root, variant)
             )?;
         }
         writeln!(f, "}}")?;
@@ -1168,14 +1186,14 @@ impl RustGen {
     }
 
     /// Signature fragment name: Type, ... for a method's non-self args, plus the ` -> Ret` suffix.
-    fn rust_signature(func: &Function) -> (String, String) {
-        Self::rust_sig_parts(&func.function_args, func.return_val.as_ref())
+    fn rust_signature(root: &str, func: &Function) -> (String, String) {
+        Self::rust_sig_parts(root, &func.function_args, func.return_val.as_ref())
     }
 
     /// Signature fragment from a bare arg list + optional return - the shared core
     /// of [`rust_signature`], reused by callback aliases (same shape, no
     /// enclosing Function). Self args are filtered out; callbacks carry none.
-    fn rust_sig_parts(args: &[Variable], ret: Option<&Variable>) -> (String, String) {
+    fn rust_sig_parts(root: &str, args: &[Variable], ret: Option<&Variable>) -> (String, String) {
         let params = args
             .iter()
             .filter(|a| a.vtype != VariableType::SelfType)
@@ -1183,7 +1201,7 @@ impl RustGen {
                 // An `[*const T]` array arg crosses the ABI as a raw pointer plus an auto `<name>_size: u32`
                 // length companion - the sys-extern mirror of the C `T*, uint32_t <name>_size` lowering.
                 if matches!(a.array, Some(ArrayType::Unsized)) {
-                    let base = Self::rust_base_type(a);
+                    let base = Self::rust_base_type(root, a);
                     let ptr = if a.pointer {
                         format!("*mut {}", base)
                     } else {
@@ -1191,13 +1209,13 @@ impl RustGen {
                     };
                     format!("{}: {}, {}_size: u32", a.name, ptr, a.name)
                 } else {
-                    format!("{}: {}", a.name, Self::rust_field_type(a))
+                    format!("{}: {}", a.name, Self::rust_field_type(root, a))
                 }
             })
             .collect::<Vec<_>>()
             .join(", ");
         let ret = match ret {
-            Some(v) => format!(" -> {}", Self::rust_field_type(v)),
+            Some(v) => format!(" -> {}", Self::rust_field_type(root, v)),
             None => String::new(),
         };
         (params, ret)
@@ -1208,9 +1226,9 @@ impl RustGen {
     /// the null-pointer niche, ABI-identical to a bare fn pointer for the non-null
     /// case, matching the nullable struct fn-field mirror. Spelled by the unprefixed
     /// IDL name; the C side emits the matching typedef.
-    fn generate_callback_alias<W: Write>(f: &mut W, cb: &Callback) -> io::Result<()> {
+    fn generate_callback_alias<W: Write>(f: &mut W, root: &str, cb: &Callback) -> io::Result<()> {
         Self::write_comment(f, &cb.doc_comments, 0)?;
-        let (params, ret) = Self::rust_sig_parts(&cb.function_args, cb.return_val.as_ref());
+        let (params, ret) = Self::rust_sig_parts(root, &cb.function_args, cb.return_val.as_ref());
         writeln!(
             f,
             "pub type {} = Option<unsafe extern \"C\" fn({}){}>;",
@@ -1224,10 +1242,10 @@ impl RustGen {
     /// a generated signature can name a read-payload type one of them defines. Mirrors
     /// the C header's `#include` of the same header; unused_imports is allowed since
     /// not every binding in a def names one.
-    fn generate_mod_imports<W: Write>(f: &mut W, api_def: &ApiDef) -> io::Result<()> {
+    fn generate_mod_imports<W: Write>(f: &mut W, root: &str, api_def: &ApiDef) -> io::Result<()> {
         for m in &api_def.mods {
             writeln!(f, "#[allow(unused_imports)]")?;
-            writeln!(f, "use crate::{}::*;", m)?;
+            writeln!(f, "use {}::{}::*;", root, m)?;
         }
         if !api_def.mods.is_empty() {
             writeln!(f)?;
@@ -1262,6 +1280,7 @@ impl RustGen {
         api_def: &ApiDef,
         reg: &TypeRegistry,
         script: &str,
+        root: &str,
     ) -> io::Result<()> {
         let filename = format!("{}/{}.rs", rust_dir, api_def.base_filename);
         let mut f = BufWriter::new(File::create(&filename)?);
@@ -1269,7 +1288,7 @@ impl RustGen {
         write!(f, "{}", crate::emit_util::header(script))?;
         writeln!(f)?;
 
-        Self::generate_mod_imports(&mut f, api_def)?;
+        Self::generate_mod_imports(&mut f, root, api_def)?;
 
         // `#[const]` constants emit as pub const (u64), mirroring the C header's
         // `#define`.
@@ -1303,7 +1322,7 @@ impl RustGen {
         // `callback <Name>` aliases - emitted after the extern-opaque ZSTs they may
         // name and before the structs, so a struct field may reference the alias.
         for cb in &api_def.callbacks {
-            Self::generate_callback_alias(&mut f, cb)?;
+            Self::generate_callback_alias(&mut f, root, cb)?;
         }
 
         for sdef in &api_def.structs {
@@ -1312,7 +1331,7 @@ impl RustGen {
             } else if sdef.is_opaque() {
                 Self::generate_opaque_type(&mut f, sdef)?;
             } else {
-                Self::generate_data_struct(&mut f, sdef, reg)?;
+                Self::generate_data_struct(&mut f, root, sdef, reg)?;
             }
         }
 
@@ -1320,7 +1339,7 @@ impl RustGen {
         // `#[attributes(service)]` block is no different - it declares the same
         // extern "C" block, its slots linking the raw exported symbols.
         for api in &api_def.apis {
-            Self::generate_api_externs(&mut f, api)?;
+            Self::generate_api_externs(&mut f, root, api)?;
         }
 
         Ok(())
@@ -1332,7 +1351,7 @@ impl RustGen {
     /// spells through c_value_type, so the two stay ABI-identical. Varargs slots
     /// are skipped: stable Rust cannot call a C variadic, so C reaches them
     /// through the `FL_<DOMAIN>_<FN>` macro. `[c_only]` slots are skipped too.
-    fn generate_api_externs<W: Write>(f: &mut W, api: &Api) -> io::Result<()> {
+    fn generate_api_externs<W: Write>(f: &mut W, root: &str, api: &Api) -> io::Result<()> {
         let mut funcs = api
             .functions
             .iter()
@@ -1354,7 +1373,7 @@ impl RustGen {
         }
         writeln!(f, "extern \"C\" {{")?;
         for func in funcs {
-            let (params, ret) = Self::rust_signature(func);
+            let (params, ret) = Self::rust_signature(root, func);
             Self::write_comment(f, &func.doc_comments, 4)?;
             writeln!(f, "    pub fn {}({}){};", func.c_name, params, ret)?;
         }
@@ -1426,8 +1445,8 @@ impl RustGen {
     /// handled by the caller (`impl AsRef<str>`); every generated data type / enum /
     /// handle is spelled `flowi_sys::<Name>`, which side-steps a re-export clash
     /// between a domain façade struct and a same-named data type (e.g. Cursor).
-    fn facade_base_type(var: &Variable) -> String {
-        Self::loose_symbol_base_type(LooseSymbolSurface::DirectLink, var)
+    fn facade_base_type(raw: &str, var: &Variable) -> String {
+        Self::loose_symbol_base_type(LooseSymbolSurface::DirectLink(raw), var)
     }
 
     /// How a referring signature spells a mirrored struct's safe twin:
@@ -1463,7 +1482,7 @@ impl RustGen {
     /// The Rust façade spelling of a `[slice(T)]` / `[slice_mut(T)]` element type T:
     /// a primitive maps through (u64, core::ffi::c_void for void), every
     /// generated mirror is reached through the surface's crate root.
-    fn facade_slice_elem_type(surface: LooseSymbolSurface, name: &str) -> String {
+    fn facade_slice_elem_type(surface: LooseSymbolSurface<'_>, name: &str) -> String {
         let root = Self::loose_symbol_crate_root(surface);
         if is_primitive(name) {
             Self::ffi_primitive(name)
@@ -1487,13 +1506,18 @@ impl RustGen {
     /// block) before the slot call - the `[retained]` copy-into-owned-storage
     /// lowering; empty otherwise.
     fn facade_args(
+        raw: &str,
         func: &Function,
         handle: Option<&str>,
         out_idx: Option<usize>,
     ) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
-        let lowered =
-            Self::lower_loose_symbol_args(LooseSymbolSurface::DirectLink, func, handle, out_idx)
-                .unwrap_or_else(|diag| panic!("{}", diag));
+        let lowered = Self::lower_loose_symbol_args(
+            LooseSymbolSurface::DirectLink(raw),
+            func,
+            handle,
+            out_idx,
+        )
+        .unwrap_or_else(|diag| panic!("{}", diag));
         (lowered.params, lowered.ffi, lowered.prelude, lowered.pre)
     }
 
@@ -1504,8 +1528,8 @@ impl RustGen {
     /// safe spelling would be `Option<&'a T>`, but no façade parameter carries 'a
     /// (façades are static methods on ZST domain structs), so a caller could infer
     /// 'static and hold the reference past the C-owned pointee's real lifetime.
-    fn facade_return(func: &Function) -> Option<(String, String)> {
-        match Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
+    fn facade_return(raw: &str, func: &Function) -> Option<(String, String)> {
+        match Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink(raw), func)
             .unwrap_or_else(|diag| panic!("{}", diag))
         {
             LoweredResult::Unit => None,
@@ -1542,8 +1566,8 @@ impl RustGen {
     /// (None, call) for a () return, the call itself when the raw result passes
     /// through, or `let ret = <call>; <wrap>` when it needs wrapping. A wrap touches
     /// the raw slot result, so the binding and the wrap share one unsafe block.
-    fn facade_call_expr(func: &Function, call: String) -> (Option<String>, String) {
-        match Self::facade_return(func) {
+    fn facade_call_expr(raw: &str, func: &Function, call: String) -> (Option<String>, String) {
+        match Self::facade_return(raw, func) {
             None => (None, call),
             Some((ret_ty, wrap)) => {
                 if wrap == "ret" {
@@ -1616,14 +1640,14 @@ impl RustGen {
     /// optional const pointer an `Option<&'a T>`, a nested mirrored config its own
     /// twin, a mutable pointer to an opaque type the raw pointer, and everything else
     /// passes through as the ABI type.
-    fn mirror_field_type(var: &Variable) -> String {
+    fn mirror_field_type(raw: &str, var: &Variable) -> String {
         if var.vtype == VariableType::Str {
             return "&'a str".to_owned();
         }
         if let Some(nested) = Self::mirror_field_nested(var) {
             return Self::mirror_path(&var.type_name, nested, "'a");
         }
-        let base = Self::facade_base_type(var);
+        let base = Self::facade_base_type(raw, var);
         if var.const_pointer {
             format!("Option<&'a {}>", base)
         } else if var.pointer {
@@ -1694,17 +1718,17 @@ impl RustGen {
     /// Lower one mirrored field back to its ABI spelling inside to_sys. A string is
     /// copied into the per-frame arena; an optional reference becomes a pointer or
     /// null; everything else is Copy and passes through.
-    fn mirror_field_to_sys(var: &Variable) -> String {
+    fn mirror_field_to_sys(raw: &str, var: &Variable) -> String {
         let name = Self::rust_ident(&var.name);
         if var.vtype == VariableType::Str {
-            Self::arena_str_expr(&format!("self.{}", name))
+            Self::arena_str_expr(raw, &format!("self.{}", name))
         } else if Self::mirror_field_nested(var).is_some() {
             format!("self.{}.to_sys()", name)
         } else if var.const_pointer {
             format!(
                 "self.{}.map_or(core::ptr::null(), |v| v as *const {})",
                 name,
-                Self::facade_base_type(var)
+                Self::facade_base_type(raw, var)
             )
         } else {
             format!("self.{}", name)
@@ -1721,7 +1745,7 @@ impl RustGen {
     /// one C either reads during the call or keeps no longer than the frame; a field a
     /// C consumer stores across frames needs a longer-lived allocation and must not be
     /// mirrored this way.
-    fn generate_mirror_struct<W: Write>(f: &mut W, sdef: &Struct) -> io::Result<()> {
+    fn generate_mirror_struct<W: Write>(f: &mut W, raw: &str, sdef: &Struct) -> io::Result<()> {
         // Borrowing is transitive through a nested twin: a config whose only string
         // lives in the WidgetConfig it embeds still carries the borrow. The parser
         // resolved that when it annotated the field, so read it back off the field.
@@ -1742,7 +1766,7 @@ impl RustGen {
         writeln!(f, "///")?;
         writeln!(
             f,
-            "/// The safe twin of [`flowi_sys::{}`]: each FlString field is a plain &str and each optional",
+            "/// The safe twin of [`{raw}::{}`]: each FlString field is a plain &str and each optional",
             sdef.name
         )?;
         writeln!(
@@ -1751,7 +1775,7 @@ impl RustGen {
         )?;
         writeln!(
             f,
-            "/// flowi_sys import. Build one with ..Default::default() - [`Default`] is the C zero default -"
+            "/// {raw} import. Build one with ..Default::default() - [`Default`] is the C zero default -"
         )?;
         writeln!(
             f,
@@ -1772,7 +1796,7 @@ impl RustGen {
                 f,
                 "    pub {}: {},",
                 Self::rust_ident(&var.name),
-                Self::mirror_field_type(var)
+                Self::mirror_field_type(raw, var)
             )?;
         }
         writeln!(f, "}}")?;
@@ -1802,7 +1826,7 @@ impl RustGen {
         if needs_zero {
             writeln!(
                 f,
-                "        // SAFETY: flowi_sys::{} is a `#[repr(C)]` plain-data mirror of the C struct, whose",
+                "        // SAFETY: {raw}::{} is a `#[repr(C)]` plain-data mirror of the C struct, whose",
                 sdef.name
             )?;
             writeln!(
@@ -1815,7 +1839,7 @@ impl RustGen {
             )?;
             writeln!(
                 f,
-                "        let zero: flowi_sys::{} = unsafe {{ core::mem::zeroed() }};",
+                "        let zero: {raw}::{} = unsafe {{ core::mem::zeroed() }};",
                 sdef.name
             )?;
         }
@@ -1846,7 +1870,7 @@ impl RustGen {
         writeln!(f, "    #[inline]")?;
         writeln!(
             f,
-            "    pub(crate) fn to_sys(self) -> flowi_sys::{} {{",
+            "    pub(crate) fn to_sys(self) -> {raw}::{} {{",
             sdef.name
         )?;
         // Only a direct string field reaches the fl_frame_str extern; a nested twin
@@ -1872,14 +1896,14 @@ impl RustGen {
             ("", "", "")
         };
         write!(f, "{}", open)?;
-        writeln!(f, "        {}flowi_sys::{} {{", indent, sdef.name)?;
+        writeln!(f, "        {}{raw}::{} {{", indent, sdef.name)?;
         for var in &sdef.variables {
             writeln!(
                 f,
                 "            {}{}: {},",
                 indent,
                 Self::rust_ident(&var.name),
-                Self::mirror_field_to_sys(var)
+                Self::mirror_field_to_sys(raw, var)
             )?;
         }
         writeln!(f, "        {}}}", indent)?;
@@ -1892,26 +1916,27 @@ impl RustGen {
     /// Emit one façade method for a slot, forwarding to the direct `fl_*` function.
     fn generate_facade_fn<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         if func.is_status {
-            return Self::generate_facade_status_fn(f, func, guard);
+            return Self::generate_facade_status_fn(f, raw, func, guard);
         }
         if func.is_transfer {
-            return Self::generate_facade_transfer_fn(f, func, guard);
+            return Self::generate_facade_transfer_fn(f, raw, func, guard);
         }
         if Self::is_option_shape(func) {
-            return Self::generate_facade_option_fn(f, func, guard);
+            return Self::generate_facade_option_fn(f, raw, func, guard);
         }
         let method = Self::facade_method_name(&func.name);
-        let (params, ffi, prelude, pre) = Self::facade_args(func, None, None);
+        let (params, ffi, prelude, pre) = Self::facade_args(raw, func, None, None);
         let params = params.join(", ");
         let ffi = ffi.join(", ");
         // The public method drops any _impl suffix; the C function keeps its full
         // c_name.
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi);
-        let (ret_ty, tail) = Self::facade_call_expr(func, call);
+        let call = format!("{raw}::{}({})", func.c_name, ffi);
+        let (ret_ty, tail) = Self::facade_call_expr(raw, func, call);
 
         Self::write_comment(f, &func.doc_comments, 4)?;
         // The primary slot's method is new but returns the widget's Signal, not
@@ -1927,18 +1952,19 @@ impl RustGen {
 
     fn generate_facade_option_fn<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let LoweredResult::Option { ty } =
-            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
+            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink(raw), func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
         else {
             unreachable!("option emitter called for non-option slot")
         };
         let out_idx = Self::out_param_index(func).expect("option shape has out param");
-        let (params, ffi, prelude, pre) = Self::facade_args(func, None, Some(out_idx));
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
+        let (params, ffi, prelude, pre) = Self::facade_args(raw, func, None, Some(out_idx));
+        let call = format!("{raw}::{}({})", func.c_name, ffi.join(", "));
         let method = Self::facade_method_name(&func.name);
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
@@ -1968,17 +1994,18 @@ impl RustGen {
 
     fn generate_facade_transfer_fn<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let LoweredResult::Transfer { owned_ty } =
-            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
+            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink(raw), func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
         else {
             unreachable!("transfer emitter called for non-transfer slot")
         };
-        let (params, ffi, prelude, pre) = Self::facade_args(func, None, None);
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
+        let (params, ffi, prelude, pre) = Self::facade_args(raw, func, None, None);
+        let call = format!("{raw}::{}({})", func.c_name, ffi.join(", "));
         let method = Self::facade_method_name(&func.name);
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
@@ -2006,21 +2033,22 @@ impl RustGen {
     /// decodes the returned status code through crate::FlError::from_status.
     fn generate_facade_status_fn<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let LoweredResult::Status { ok_ty, has_out } =
-            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
+            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink(raw), func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
         else {
             unreachable!("status emitter called for non-status slot")
         };
         let method = Self::facade_method_name(&func.name);
         let out_idx = Self::out_param_index(func);
-        let (params, ffi, prelude, pre) = Self::facade_args(func, None, out_idx);
+        let (params, ffi, prelude, pre) = Self::facade_args(raw, func, None, out_idx);
         let params = params.join(", ");
         let ffi = ffi.join(", ");
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi);
+        let call = format!("{raw}::{}({})", func.c_name, ffi);
         let ret_ty = format!("Result<{}, crate::FlError>", ok_ty);
 
         Self::write_comment(f, &func.doc_comments, 4)?;
@@ -2043,7 +2071,7 @@ impl RustGen {
             writeln!(
                 f,
                 "        crate::FlError::from_status({})?;",
-                Self::status_as_i32(LooseSymbolSurface::DirectLink, func)
+                Self::status_as_i32(LooseSymbolSurface::DirectLink(raw), func)
             )?;
             if has_out {
                 write!(f, "{}", safety_assume_init("        ", "a success status"))?;
@@ -2105,9 +2133,9 @@ impl RustGen {
     /// type. A typed opaque handle becomes `*mut flowi_sys::<T>`, so Drop and the
     /// receiver slots thread it straight into the `fl_*` slots that take that exact
     /// pointer - no cast.
-    fn raii_handle_type(drop_fn: &Function) -> String {
+    fn raii_handle_type(raw: &str, drop_fn: &Function) -> String {
         Self::raii_handle_arg(drop_fn)
-            .map(|a| format!("*mut {}", Self::facade_base_type(a)))
+            .map(|a| format!("*mut {}", Self::facade_base_type(raw, a)))
             .unwrap_or_else(|| "*mut core::ffi::c_void".to_owned())
     }
 
@@ -2126,12 +2154,17 @@ impl RustGen {
     /// Emit one RAII receiver method, forwarding to the direct `fl_*` function with
     /// the handle argument supplied from self.handle. The receiver is &self for a
     /// `[const]` slot, else &mut self; the emitted name honors `[rename(...)]`.
-    fn generate_raii_method<W: Write>(f: &mut W, func: &Function, handle: &str) -> io::Result<()> {
+    fn generate_raii_method<W: Write>(
+        f: &mut W,
+        raw: &str,
+        func: &Function,
+        handle: &str,
+    ) -> io::Result<()> {
         let method = func.rename.as_deref().unwrap_or(&func.name);
         let receiver = if func.is_const { "&self" } else { "&mut self" };
 
         if func.is_status {
-            return Self::generate_raii_status_method(f, func, handle, receiver, method);
+            return Self::generate_raii_status_method(f, raw, func, handle, receiver, method);
         }
         if Self::is_option_shape(func)
             && func
@@ -2139,18 +2172,18 @@ impl RustGen {
                 .last()
                 .is_some_and(|arg| arg.name != handle)
         {
-            return Self::generate_raii_option_method(f, func, handle, receiver, method);
+            return Self::generate_raii_option_method(f, raw, func, handle, receiver, method);
         }
         if func.is_transfer {
-            return Self::generate_raii_transfer_method(f, func, handle, receiver, method);
+            return Self::generate_raii_transfer_method(f, raw, func, handle, receiver, method);
         }
 
-        let (arg_params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), None);
+        let (arg_params, ffi, prelude, pre) = Self::facade_args(raw, func, Some(handle), None);
         let mut params = vec![receiver.to_owned()];
         params.extend(arg_params);
         let params = params.join(", ");
         let ffi = ffi.join(", ");
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi);
+        let call = format!("{raw}::{}({})", func.c_name, ffi);
         let (ret_ty, tail) = if Self::is_option_shape(func)
             && func
                 .function_args
@@ -2159,7 +2192,7 @@ impl RustGen {
         {
             (Some("bool".to_owned()), call)
         } else {
-            Self::facade_call_expr(func, call)
+            Self::facade_call_expr(raw, func, call)
         };
 
         Self::write_comment(f, &func.doc_comments, 4)?;
@@ -2170,21 +2203,22 @@ impl RustGen {
 
     fn generate_raii_status_method<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         handle: &str,
         receiver: &str,
         method: &str,
     ) -> io::Result<()> {
         let LoweredResult::Status { ok_ty, has_out } =
-            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
+            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink(raw), func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
         else {
             unreachable!()
         };
         let out_idx = Self::out_param_index(func);
-        let (mut params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), out_idx);
+        let (mut params, ffi, prelude, pre) = Self::facade_args(raw, func, Some(handle), out_idx);
         params.insert(0, receiver.to_owned());
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
+        let call = format!("{raw}::{}({})", func.c_name, ffi.join(", "));
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
@@ -2210,7 +2244,7 @@ impl RustGen {
                 writeln!(
                     f,
                     "        crate::FlError::from_status({})?;",
-                    Self::status_as_i32(LooseSymbolSurface::DirectLink, func)
+                    Self::status_as_i32(LooseSymbolSurface::DirectLink(raw), func)
                 )?;
                 if has_out {
                     write!(f, "{}", safety_assume_init("        ", "a success status"))?;
@@ -2224,21 +2258,23 @@ impl RustGen {
 
     fn generate_raii_option_method<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         handle: &str,
         receiver: &str,
         method: &str,
     ) -> io::Result<()> {
         let LoweredResult::Option { ty } =
-            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
+            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink(raw), func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
         else {
             unreachable!()
         };
         let out_idx = Self::out_param_index(func).expect("option shape has out param");
-        let (mut params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), Some(out_idx));
+        let (mut params, ffi, prelude, pre) =
+            Self::facade_args(raw, func, Some(handle), Some(out_idx));
         params.insert(0, receiver.to_owned());
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
+        let call = format!("{raw}::{}({})", func.c_name, ffi.join(", "));
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
@@ -2267,20 +2303,21 @@ impl RustGen {
 
     fn generate_raii_transfer_method<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         handle: &str,
         receiver: &str,
         method: &str,
     ) -> io::Result<()> {
         let LoweredResult::Transfer { owned_ty } =
-            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink, func)
+            Self::lower_loose_symbol_result(LooseSymbolSurface::DirectLink(raw), func)
                 .unwrap_or_else(|diag| panic!("{}", diag))
         else {
             unreachable!()
         };
-        let (mut params, ffi, prelude, pre) = Self::facade_args(func, Some(handle), None);
+        let (mut params, ffi, prelude, pre) = Self::facade_args(raw, func, Some(handle), None);
         params.insert(0, receiver.to_owned());
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi.join(", "));
+        let call = format!("{raw}::{}({})", func.c_name, ffi.join(", "));
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(
             f,
@@ -2305,9 +2342,14 @@ impl RustGen {
     /// (calling the `[drop]` destructor and nulling the handle), and the generated
     /// receiver methods. The handle field is pub(crate) so the flowi crate's
     /// hand-written constructor / bespoke slots (and List) can reach it.
-    fn generate_raii_facade<W: Write>(f: &mut W, api: &Api, drop_fn: &Function) -> io::Result<()> {
+    fn generate_raii_facade<W: Write>(
+        f: &mut W,
+        raw: &str,
+        api: &Api,
+        drop_fn: &Function,
+    ) -> io::Result<()> {
         let handle = Self::raii_handle_name(drop_fn);
-        let handle_ty = Self::raii_handle_type(drop_fn);
+        let handle_ty = Self::raii_handle_type(raw, drop_fn);
         let transfer_destroy: std::collections::HashSet<&str> = api
             .functions
             .iter()
@@ -2325,7 +2367,7 @@ impl RustGen {
         writeln!(f, "        if !self.handle.is_null() {{")?;
         writeln!(
             f,
-            "            unsafe {{ flowi_sys::{}(self.handle) }};",
+            "            unsafe {{ {raw}::{}(self.handle) }};",
             drop_fn.c_name
         )?;
         writeln!(f, "            self.handle = core::ptr::null_mut();")?;
@@ -2351,7 +2393,7 @@ impl RustGen {
                     writeln!(f)?;
                 }
                 first = false;
-                Self::generate_raii_method(f, func, handle)?;
+                Self::generate_raii_method(f, raw, func, handle)?;
             }
             writeln!(f, "}}")?;
             writeln!(f)?;
@@ -2391,6 +2433,7 @@ impl RustGen {
     /// not an owned handle.
     fn generate_scope_guard<W: Write>(
         f: &mut W,
+        raw: &str,
         api: &Api,
         begin_fn: &Function,
         end_fn: &Function,
@@ -2447,7 +2490,7 @@ impl RustGen {
         if let Some(frame_guard) = frame_guard {
             frame_guard.write_statement(f, end)?;
         }
-        writeln!(f, "        unsafe {{ flowi_sys::{}() }};", end_fn.c_name)?;
+        writeln!(f, "        unsafe {{ {raw}::{}() }};", end_fn.c_name)?;
         writeln!(f, "    }}")?;
         writeln!(f, "}}")?;
         writeln!(f)?;
@@ -2459,12 +2502,13 @@ impl RustGen {
     /// `<Domain>Scope` token.
     fn generate_scope_begin_fn<W: Write>(
         f: &mut W,
+        raw: &str,
         func: &Function,
         scope_ty: &str,
         guard: Option<&FrameGuard>,
     ) -> io::Result<()> {
         let method = Self::facade_method_name(&func.name);
-        let (params, ffi, prelude, pre) = Self::facade_args(func, None, None);
+        let (params, ffi, prelude, pre) = Self::facade_args(raw, func, None, None);
         assert!(
             prelude.is_empty(),
             "[retained] is only supported on stateless façade slots ({})",
@@ -2472,7 +2516,7 @@ impl RustGen {
         );
         let params = params.join(", ");
         let ffi = ffi.join(", ");
-        let call = format!("flowi_sys::{}({})", func.c_name, ffi);
+        let call = format!("{raw}::{}({})", func.c_name, ffi);
 
         Self::write_comment(f, &func.doc_comments, 4)?;
         Self::write_facade_method(f, guard, &pre, method, &params, Some(scope_ty), |f| {
@@ -2511,6 +2555,7 @@ impl RustGen {
         api_def: &ApiDef,
         script: &str,
         frame_guard: Option<&str>,
+        raw: &str,
     ) -> io::Result<bool> {
         // A `#[attributes(service)]` block has no direct-link façade: the
         // external-consumer wrapper pass owns that surface.
@@ -2536,7 +2581,7 @@ impl RustGen {
         // The safe config twins first: a slot in this same def may take one, and a
         // def can consist of nothing else (the shared widget config).
         for sdef in mirrors {
-            Self::generate_mirror_struct(f, sdef)?;
+            Self::generate_mirror_struct(f, raw, sdef)?;
         }
 
         for api in &api_def.apis {
@@ -2556,13 +2601,13 @@ impl RustGen {
                     let mut owned = String::new();
                     Self::write_owned_newtype(
                         &mut owned,
-                        LooseSymbolSurface::DirectLink,
-                        Some("flowi_sys"),
+                        LooseSymbolSurface::DirectLink(raw),
+                        Some(raw),
                         &api.name,
                         ret,
                         &free_fn.c_name,
                         &Self::loose_symbol_ffi_type(
-                            LooseSymbolSurface::DirectLink,
+                            LooseSymbolSurface::DirectLink(raw),
                             &free_fn.function_args[0],
                         ),
                     );
@@ -2586,7 +2631,7 @@ impl RustGen {
                     "api_gen: façade `{}`: #[frame_context] and [frame] are not supported on a block with a [drop] slot",
                     api.name
                 );
-                Self::generate_raii_facade(f, api, drop_fn)?;
+                Self::generate_raii_facade(f, raw, api, drop_fn)?;
                 continue;
             }
             if !api.functions.iter().any(Self::facade_generates) {
@@ -2597,7 +2642,7 @@ impl RustGen {
             // guard-returning method instead of a bare void forwarder.
             let scope = Self::api_scope_begin_fn(api).zip(Self::api_scope_end_fn(api));
             if let Some((begin_fn, end_fn)) = scope {
-                Self::generate_scope_guard(f, api, begin_fn, end_fn, slot_guard(end_fn))?;
+                Self::generate_scope_guard(f, raw, api, begin_fn, end_fn, slot_guard(end_fn))?;
             }
 
             Self::write_comment(f, &api.doc_comments, 0)?;
@@ -2615,6 +2660,7 @@ impl RustGen {
                 if scope.is_some() && func.is_scope_begin {
                     Self::generate_scope_begin_fn(
                         f,
+                        raw,
                         func,
                         &Self::scope_guard_name(api),
                         slot_guard(func),
@@ -2622,7 +2668,7 @@ impl RustGen {
                 } else if scope.is_some() && func.is_scope_end {
                     Self::generate_scope_end_fn(f, func, &Self::scope_guard_name(api))?;
                 } else {
-                    Self::generate_facade_fn(f, func, slot_guard(func))?;
+                    Self::generate_facade_fn(f, raw, func, slot_guard(func))?;
                 }
             }
             writeln!(f, "}}")?;
@@ -2724,13 +2770,13 @@ impl RustGen {
     // diagnostic - never a guess.
 
     /// Base FFI spelling of a value's type, no pointer qualifier.
-    fn loose_symbol_ffi_base(surface: LooseSymbolSurface, var: &Variable) -> String {
+    fn loose_symbol_ffi_base(surface: LooseSymbolSurface<'_>, var: &Variable) -> String {
         Self::loose_symbol_base_type(surface, var)
     }
 
     /// Full FFI spelling of a value (base + pointer / fixed-array qualifier) - the
     /// type an exported service symbol's extern "C" declaration crosses.
-    fn loose_symbol_ffi_type(surface: LooseSymbolSurface, var: &Variable) -> String {
+    fn loose_symbol_ffi_type(surface: LooseSymbolSurface<'_>, var: &Variable) -> String {
         let base = Self::apply_pointer(var, Self::loose_symbol_ffi_base(surface, var));
         match &var.array {
             Some(ArrayType::SizedArray(n)) => format!("[{}; {}]", base, n),
@@ -2742,7 +2788,7 @@ impl RustGen {
     /// extern "C" declaration, spelled in the surface's FFI types. An unsized array
     /// arg lowers to a `ptr, <name>_size: u32` pair.
     fn loose_symbol_sig_parts(
-        surface: LooseSymbolSurface,
+        surface: LooseSymbolSurface<'_>,
         args: &[Variable],
         ret: Option<&Variable>,
     ) -> (String, String) {
@@ -3133,7 +3179,7 @@ impl RustGen {
     /// reads an i32, but the C status is whatever the slot declares, so the cast is
     /// emitted only when the declared type is not already i32 - casting i32 to i32
     /// is a clippy warning in the generated file.
-    fn status_as_i32(surface: LooseSymbolSurface, func: &Function) -> &'static str {
+    fn status_as_i32(surface: LooseSymbolSurface<'_>, func: &Function) -> &'static str {
         match func.return_val.as_ref() {
             Some(ret) if Self::loose_symbol_ffi_type(surface, ret) == "i32" => "status",
             _ => "status as i32",
@@ -3289,7 +3335,7 @@ impl RustGen {
     /// it so a `*const`/`*mut` mismatch is a no-op cast, not a compile error.
     fn write_owned_newtype(
         out: &mut String,
-        surface: LooseSymbolSurface,
+        surface: LooseSymbolSurface<'_>,
         raw: Option<&str>,
         service: &str,
         ret: &Variable,
@@ -3679,7 +3725,7 @@ mod tests {
             "arena.def",
         );
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&svc));
-        RustGen::generate(dir_s, &svc, &reg, "scripts/gen.sh").expect("generate svc");
+        RustGen::generate(dir_s, &svc, &reg, "scripts/gen.sh", "crate").expect("generate svc");
         let svc_rs = std::fs::read_to_string(dir.join("arena.rs")).expect("read svc rs");
         assert!(
             svc_rs.contains("extern \"C\" {")
@@ -3701,7 +3747,7 @@ mod tests {
             "arena.def",
         );
         let reg2 = crate::layout::TypeRegistry::build(std::slice::from_ref(&plain));
-        RustGen::generate(dir_s, &plain, &reg2, "scripts/gen.sh").expect("generate plain");
+        RustGen::generate(dir_s, &plain, &reg2, "scripts/gen.sh", "crate").expect("generate plain");
         let plain_rs = std::fs::read_to_string(dir.join("arena.rs")).expect("read plain rs");
         assert!(
             plain_rs.contains("pub fn fl_arena_rewind(arena: *mut crate::Arena);"),
@@ -3740,8 +3786,14 @@ mod tests {
             ));
             std::fs::create_dir_all(&dir).expect("mk dir");
             let def = parse_one(&src(attr), "gadget.def");
-            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", path)
-                .expect("facade");
+            RustGen::generate_facade(
+                dir.to_str().unwrap(),
+                &def,
+                "scripts/gen.sh",
+                path,
+                "flowi_sys",
+            )
+            .expect("facade");
             std::fs::read_to_string(dir.join("gadget.rs")).expect("read facade")
         };
         let path = Some("crate::frame_thread::frame_thread_guard");
@@ -3779,8 +3831,14 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("mk dir");
         let def = parse_one(defs, "gadget.def");
-        RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", path)
-            .expect("facade");
+        RustGen::generate_facade(
+            dir.to_str().unwrap(),
+            &def,
+            "scripts/gen.sh",
+            path,
+            "flowi_sys",
+        )
+        .expect("facade");
         std::fs::read_to_string(dir.join("gadget.rs")).expect("read facade")
     }
 
@@ -3876,10 +3934,14 @@ mod tests {
              }",
             "theme.def",
         );
-        assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &api_def, "scripts/gen.sh", None)
-                .expect("facade")
-        );
+        assert!(RustGen::generate_facade(
+            dir.to_str().unwrap(),
+            &api_def,
+            "scripts/gen.sh",
+            None,
+            "flowi_sys"
+        )
+        .expect("facade"));
         let out = std::fs::read_to_string(dir.join("theme.rs")).expect("read facade");
 
         // Both slots keep the ergonomic borrow signature - callers are unaffected.
@@ -3923,7 +3985,7 @@ mod tests {
             "backend.def",
         );
         let mut buf = Vec::new();
-        RustGen::generate_mod_imports(&mut buf, &api_def).expect("emit imports");
+        RustGen::generate_mod_imports(&mut buf, "crate", &api_def).expect("emit imports");
         let out = String::from_utf8(buf).expect("utf8");
 
         assert!(out.contains("use crate::render_ir::*;"), "first mod import");
@@ -3931,7 +3993,7 @@ mod tests {
 
         let plain = parse_one("struct Plain { x: f32 }", "plain.def");
         let mut pbuf = Vec::new();
-        RustGen::generate_mod_imports(&mut pbuf, &plain).expect("emit");
+        RustGen::generate_mod_imports(&mut pbuf, "crate", &plain).expect("emit");
         assert!(pbuf.is_empty(), "no mod => no import lines");
 
         let Some(rustc) = find_rustc() else {
@@ -4028,7 +4090,7 @@ mod tests {
             .expect("parsed");
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&api_def));
         let mut buf = Vec::new();
-        RustGen::generate_data_struct(&mut buf, sdef, &reg).expect("emit");
+        RustGen::generate_data_struct(&mut buf, "crate", sdef, &reg).expect("emit");
         let out = String::from_utf8(buf).expect("utf8");
 
         assert!(
@@ -4062,7 +4124,7 @@ mod tests {
             .expect("parsed");
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&api_def));
         let mut buf = Vec::new();
-        RustGen::generate_data_struct(&mut buf, sdef, &reg).expect("emit");
+        RustGen::generate_data_struct(&mut buf, "crate", sdef, &reg).expect("emit");
         let out = String::from_utf8(buf).expect("utf8");
 
         assert!(
@@ -4364,15 +4426,21 @@ mod tests {
             .expect("parsed");
         let vars = &span.variables;
         assert_eq!(
-            RustGen::rust_field_type(&vars[0]),
+            RustGen::rust_field_type("crate", &vars[0]),
             "*const core::ffi::c_char"
         );
-        assert_eq!(RustGen::rust_field_type(&vars[1]), "*mut core::ffi::c_void");
-        assert_eq!(RustGen::rust_field_type(&vars[2]), "*mut crate::Arena");
+        assert_eq!(
+            RustGen::rust_field_type("crate", &vars[1]),
+            "*mut core::ffi::c_void"
+        );
+        assert_eq!(
+            RustGen::rust_field_type("crate", &vars[2]),
+            "*mut crate::Arena"
+        );
 
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&api_def));
         let mut buf = Vec::new();
-        RustGen::generate_data_struct(&mut buf, span, &reg).expect("emit");
+        RustGen::generate_data_struct(&mut buf, "crate", span, &reg).expect("emit");
         let out = String::from_utf8(buf).expect("utf8");
         assert!(
             out.contains("pub text: *const core::ffi::c_char,"),
@@ -4400,11 +4468,14 @@ mod tests {
             .iter()
             .find(|s| s.name == "Cell")
             .expect("parsed");
-        assert_eq!(RustGen::rust_field_type(&cell.variables[0]), "[u8; 24]");
+        assert_eq!(
+            RustGen::rust_field_type("crate", &cell.variables[0]),
+            "[u8; 24]"
+        );
 
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&api_def));
         let mut buf = Vec::new();
-        RustGen::generate_data_struct(&mut buf, cell, &reg).expect("emit");
+        RustGen::generate_data_struct(&mut buf, "crate", cell, &reg).expect("emit");
         let out = String::from_utf8(buf).expect("utf8");
         assert!(
             out.contains("pub name: [u8; 24],"),
@@ -4450,7 +4521,7 @@ mod tests {
             .iter()
             .find(|s| s.name == "Backend")
             .expect("struct");
-        RustGen::generate_data_struct(&mut buf, backend, &reg).expect("struct emit");
+        RustGen::generate_data_struct(&mut buf, "crate", backend, &reg).expect("struct emit");
         let out = String::from_utf8(buf).expect("utf8");
 
         assert!(out.contains("pub enum UiCtx {}"), "UiCtx ZST");
@@ -4518,7 +4589,7 @@ mod tests {
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&api_def));
         let mut buf = Vec::new();
         for s in api_def.structs.iter().filter(|s| s.is_real_type()) {
-            RustGen::generate_data_struct(&mut buf, s, &reg).expect("emit");
+            RustGen::generate_data_struct(&mut buf, "crate", s, &reg).expect("emit");
         }
         let out = String::from_utf8(buf).expect("utf8");
 
@@ -4568,7 +4639,7 @@ mod tests {
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&api_def));
         let mut buf = Vec::new();
         for s in api_def.structs.iter().filter(|s| s.is_real_type()) {
-            RustGen::generate_data_struct(&mut buf, s, &reg).expect("emit");
+            RustGen::generate_data_struct(&mut buf, "crate", s, &reg).expect("emit");
         }
         let out = String::from_utf8(buf).expect("utf8");
 
@@ -4612,14 +4683,14 @@ mod tests {
         for ext in &api_def.externs {
             RustGen::generate_extern_opaque_type(&mut buf, ext).expect("ext");
         }
-        RustGen::generate_callback_alias(&mut buf, &api_def.callbacks[0]).expect("alias");
+        RustGen::generate_callback_alias(&mut buf, "crate", &api_def.callbacks[0]).expect("alias");
         let pipe = api_def
             .structs
             .iter()
             .find(|s| s.name == "Pipe")
             .expect("struct");
-        RustGen::generate_data_struct(&mut buf, pipe, &reg).expect("struct");
-        RustGen::generate_api_externs(&mut buf, &api_def.apis[0]).expect("externs");
+        RustGen::generate_data_struct(&mut buf, "crate", pipe, &reg).expect("struct");
+        RustGen::generate_api_externs(&mut buf, "crate", &api_def.apis[0]).expect("externs");
         let out = String::from_utf8(buf).expect("utf8");
 
         // Param names included, exactly like the struct fn-field mirror.
@@ -4677,8 +4748,8 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        RustGen::generate_api_externs(&mut buf, &cursor.apis[0]).expect("cursor externs");
-        RustGen::generate_api_externs(&mut buf, &format.apis[0]).expect("format externs");
+        RustGen::generate_api_externs(&mut buf, "crate", &cursor.apis[0]).expect("cursor externs");
+        RustGen::generate_api_externs(&mut buf, "crate", &format.apis[0]).expect("format externs");
         let externs = String::from_utf8(buf).expect("utf8");
 
         assert!(externs.contains("extern \"C\" {"), "extern block");
@@ -4760,7 +4831,7 @@ mod tests {
                 .iter()
                 .filter(|f| RustGen::facade_generates(f))
             {
-                RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
+                RustGen::generate_facade_fn(&mut buf, "flowi_sys", func, None).unwrap();
             }
             writeln!(buf, "}}").unwrap();
         }
@@ -4835,7 +4906,7 @@ mod tests {
             "sibling slot without extern-opaque args still generates"
         );
         let mut buf = Vec::new();
-        RustGen::generate_api_externs(&mut buf, api).unwrap();
+        RustGen::generate_api_externs(&mut buf, "crate", api).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("pub fn fl_icon_load(mount: *mut FlVfsMount);"),
@@ -4860,7 +4931,7 @@ mod tests {
                 .iter()
                 .filter(|f| RustGen::facade_generates(f))
             {
-                RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
+                RustGen::generate_facade_fn(&mut buf, "flowi_sys", func, None).unwrap();
             }
         }
         let out = String::from_utf8(buf).unwrap();
@@ -4893,7 +4964,7 @@ mod tests {
             .find(|f| f.name == "probe")
             .unwrap();
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, probe, None).unwrap();
+        RustGen::generate_facade_fn(&mut buf, "flowi_sys", probe, None).unwrap();
     }
 
     /// A `[status]` slot maps to `Result<T, crate::FlError>` in the direct-link façade:
@@ -4916,7 +4987,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
+            RustGen::generate_facade_fn(&mut buf, "flowi_sys", func, None).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
 
@@ -4979,7 +5050,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut fbuf, func, None).unwrap();
+            RustGen::generate_facade_fn(&mut fbuf, "flowi_sys", func, None).unwrap();
         }
         let fout = String::from_utf8(fbuf).unwrap();
         assert!(
@@ -5003,7 +5074,7 @@ mod tests {
         for func in ti.functions.iter().filter(|f| {
             RustGen::raii_generates(f) && f.function_args.iter().any(|a| a.name == handle)
         }) {
-            RustGen::generate_raii_method(&mut tbuf, func, handle).unwrap();
+            RustGen::generate_raii_method(&mut tbuf, "flowi_sys", func, handle).unwrap();
         }
         let tout = String::from_utf8(tbuf).unwrap();
         assert!(
@@ -5059,7 +5130,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut sbuf, func, None).unwrap();
+            RustGen::generate_facade_fn(&mut sbuf, "flowi_sys", func, None).unwrap();
         }
         let sout = String::from_utf8(sbuf).unwrap();
         assert!(
@@ -5082,7 +5153,7 @@ mod tests {
         for func in api.functions.iter().filter(|f| {
             RustGen::raii_generates(f) && f.function_args.iter().any(|a| a.name == handle)
         }) {
-            RustGen::generate_raii_method(&mut buf, func, handle).unwrap();
+            RustGen::generate_raii_method(&mut buf, "flowi_sys", func, handle).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
 
@@ -5130,7 +5201,7 @@ mod tests {
             .iter()
             .filter(|f| RustGen::facade_generates(f))
         {
-            RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
+            RustGen::generate_facade_fn(&mut buf, "flowi_sys", func, None).unwrap();
         }
         let out = String::from_utf8(buf).unwrap();
         assert!(
@@ -5175,7 +5246,7 @@ mod tests {
             .find(|a| a.name == "Tabs")
             .expect("Tabs block");
         let err = RustGen::lower_loose_symbol_args(
-            LooseSymbolSurface::DirectLink,
+            LooseSymbolSurface::DirectLink("flowi_sys"),
             &api.functions[0],
             None,
             None,
@@ -5209,7 +5280,7 @@ mod tests {
         let api = &api_def.apis[0];
         let drop_fn = RustGen::api_drop_fn(api).expect("drop fn");
         let mut buf = Vec::new();
-        RustGen::generate_raii_facade(&mut buf, api, drop_fn).expect("emit");
+        RustGen::generate_raii_facade(&mut buf, "flowi_sys", api, drop_fn).expect("emit");
         let out = String::from_utf8(buf).expect("utf8");
 
         assert!(
@@ -5311,7 +5382,7 @@ mod tests {
             .expect("api block");
         let drop_fn = RustGen::api_drop_fn(api).expect("drop fn");
         let mut buf = Vec::new();
-        RustGen::generate_raii_facade(&mut buf, api, drop_fn).expect("emit");
+        RustGen::generate_raii_facade(&mut buf, "flowi_sys", api, drop_fn).expect("emit");
         let out = String::from_utf8(buf).expect("utf8");
 
         assert!(
@@ -5382,7 +5453,8 @@ mod tests {
         let mut buf = Vec::new();
         let begin_fn = RustGen::api_scope_begin_fn(api).expect("scope_begin slot");
         let end_fn = RustGen::api_scope_end_fn(api).expect("scope_end slot");
-        RustGen::generate_scope_guard(&mut buf, api, begin_fn, end_fn, None).expect("guard");
+        RustGen::generate_scope_guard(&mut buf, "flowi_sys", api, begin_fn, end_fn, None)
+            .expect("guard");
         let guard = RustGen::scope_guard_name(api);
         writeln!(buf, "pub struct {};", api.name).unwrap();
         writeln!(buf, "impl {} {{", api.name).unwrap();
@@ -5392,11 +5464,12 @@ mod tests {
             .filter(|f| RustGen::facade_generates(f))
         {
             if func.is_scope_begin {
-                RustGen::generate_scope_begin_fn(&mut buf, func, &guard, None).unwrap();
+                RustGen::generate_scope_begin_fn(&mut buf, "flowi_sys", func, &guard, None)
+                    .unwrap();
             } else if func.is_scope_end {
                 RustGen::generate_scope_end_fn(&mut buf, func, &guard).unwrap();
             } else {
-                RustGen::generate_facade_fn(&mut buf, func, None).unwrap();
+                RustGen::generate_facade_fn(&mut buf, "flowi_sys", func, None).unwrap();
             }
         }
         writeln!(buf, "}}").unwrap();
@@ -5512,8 +5585,15 @@ mod tests {
             block: &api.name,
         };
         let mut buf = Vec::new();
-        RustGen::generate_scope_guard(&mut buf, api, begin_fn, end_fn, Some(&frame_guard))
-            .expect("guard");
+        RustGen::generate_scope_guard(
+            &mut buf,
+            "flowi_sys",
+            api,
+            begin_fn,
+            end_fn,
+            Some(&frame_guard),
+        )
+        .expect("guard");
         RustGen::generate_scope_end_fn(&mut buf, end_fn, "PopupScope").unwrap();
         let out = String::from_utf8(buf).unwrap();
 
@@ -5579,7 +5659,7 @@ mod tests {
         );
         let api = &def.apis[0];
         let function = |name: &str| api.functions.iter().find(|f| f.name == name).unwrap();
-        let direct = LooseSymbolSurface::DirectLink;
+        let direct = LooseSymbolSurface::DirectLink("flowi_sys");
         let external = LooseSymbolSurface::ExternalConsumer;
 
         for surface in [direct, external] {
@@ -5655,10 +5735,14 @@ mod tests {
         );
         let dir = std::env::temp_dir().join(format!("api_gen_direct_loose_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create façade dir");
-        assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", None)
-                .expect("generate façade")
-        );
+        assert!(RustGen::generate_facade(
+            dir.to_str().unwrap(),
+            &def,
+            "scripts/gen.sh",
+            None,
+            "flowi_sys"
+        )
+        .expect("generate façade"));
         let out = std::fs::read_to_string(dir.join("gadget.rs")).expect("read façade");
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -5705,7 +5789,13 @@ mod tests {
     fn status_decode_casts_only_a_non_i32_status() {
         let i32_status = parse_one("api Store { [status] flush() -> i32 }", "store_i32.def");
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &i32_status.apis[0].functions[0], None).unwrap();
+        RustGen::generate_facade_fn(
+            &mut buf,
+            "flowi_sys",
+            &i32_status.apis[0].functions[0],
+            None,
+        )
+        .unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("from_status(status)?;") && !out.contains("status as i32"),
@@ -5714,7 +5804,13 @@ mod tests {
 
         let wide_status = parse_one("api Store { [status] flush() -> i64 }", "store_i64.def");
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &wide_status.apis[0].functions[0], None).unwrap();
+        RustGen::generate_facade_fn(
+            &mut buf,
+            "flowi_sys",
+            &wide_status.apis[0].functions[0],
+            None,
+        )
+        .unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("from_status(status as i32)?;"), "{out}");
     }
@@ -5739,12 +5835,14 @@ mod tests {
             "painter_arity.def",
         );
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).unwrap();
+        RustGen::generate_facade_fn(&mut buf, "flowi_sys", &def.apis[0].functions[0], None)
+            .unwrap();
         assert!(String::from_utf8(buf)
             .unwrap()
             .contains("#[allow(clippy::too_many_arguments)]"));
         let mut buf: Vec<u8> = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[1], None).unwrap();
+        RustGen::generate_facade_fn(&mut buf, "flowi_sys", &def.apis[0].functions[1], None)
+            .unwrap();
         assert!(!String::from_utf8(buf)
             .unwrap()
             .contains("too_many_arguments"));
@@ -5779,10 +5877,14 @@ mod tests {
         let def = parse_one("api Cursor { set_visible(visible: bool) }", "cursor.def");
         let dir = std::env::temp_dir().join(format!("api_gen_safety_hdr_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create façade dir");
-        assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", None)
-                .expect("generate façade")
-        );
+        assert!(RustGen::generate_facade(
+            dir.to_str().unwrap(),
+            &def,
+            "scripts/gen.sh",
+            None,
+            "flowi_sys"
+        )
+        .expect("generate façade"));
         let out = std::fs::read_to_string(dir.join("cursor.rs")).expect("read façade");
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -5810,10 +5912,14 @@ mod tests {
         );
         let dir = std::env::temp_dir().join(format!("api_gen_raii_loose_{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create façade dir");
-        assert!(
-            RustGen::generate_facade(dir.to_str().unwrap(), &def, "scripts/gen.sh", None)
-                .expect("generate façade")
-        );
+        assert!(RustGen::generate_facade(
+            dir.to_str().unwrap(),
+            &def,
+            "scripts/gen.sh",
+            None,
+            "flowi_sys"
+        )
+        .expect("generate façade"));
         let out = std::fs::read_to_string(dir.join("store.rs")).expect("read façade");
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -6836,7 +6942,7 @@ mod tests {
             "cat.def",
         );
         let mut buf = Vec::new();
-        RustGen::generate_api_externs(&mut buf, &def.apis[0]).unwrap();
+        RustGen::generate_api_externs(&mut buf, "crate", &def.apis[0]).unwrap();
         let externs = String::from_utf8(buf).unwrap();
         assert!(
             externs.contains("pub fn grab(") && !externs.contains("grab_named"),
@@ -7083,7 +7189,7 @@ mod tests {
             .iter()
             .find(|s| s.is_mirror())
             .expect("the Mirror struct parses");
-        RustGen::generate_mirror_struct(&mut mirror_buf, sdef).expect("mirror");
+        RustGen::generate_mirror_struct(&mut mirror_buf, "flowi_sys", sdef).expect("mirror");
         let mirror = String::from_utf8(mirror_buf).unwrap();
 
         assert!(
@@ -7124,7 +7230,7 @@ mod tests {
 
         let mut buf = Vec::new();
         let func = &def.apis[0].functions[0];
-        RustGen::generate_facade_fn(&mut buf, func, None).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, "flowi_sys", func, None).expect("facade");
         let facade = String::from_utf8(buf).unwrap();
 
         assert!(
@@ -7199,7 +7305,7 @@ mod tests {
 
         let mut buf = Vec::new();
         for sdef in def.structs.iter().filter(|s| s.is_mirror()) {
-            RustGen::generate_mirror_struct(&mut buf, sdef).expect("mirror");
+            RustGen::generate_mirror_struct(&mut buf, "flowi_sys", sdef).expect("mirror");
         }
         let mirror = String::from_utf8(buf).unwrap();
 
@@ -7221,7 +7327,8 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, "flowi_sys", &def.apis[0].functions[0], None)
+            .expect("facade");
         let facade = String::from_utf8(buf).unwrap();
         assert!(
             !facade.contains("flowi_sys::DropdownConfig")
@@ -7295,7 +7402,7 @@ mod tests {
                 .find(|s| s.is_mirror() && s.name == name)
                 .expect("mirror");
             let mut buf = Vec::new();
-            RustGen::generate_mirror_struct(&mut buf, sdef).expect("mirror");
+            RustGen::generate_mirror_struct(&mut buf, "flowi_sys", sdef).expect("mirror");
             let mirror = String::from_utf8(buf).unwrap();
             let (_, body) = mirror.split_once("fn to_sys").expect("to_sys");
             body.to_owned()
@@ -7312,11 +7419,12 @@ mod tests {
 
         let mut buf = Vec::new();
         for sdef in def.structs.iter().filter(|s| s.is_mirror()) {
-            RustGen::generate_mirror_struct(&mut buf, sdef).expect("mirror");
+            RustGen::generate_mirror_struct(&mut buf, "flowi_sys", sdef).expect("mirror");
         }
         let mirror = String::from_utf8(buf).unwrap();
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, "flowi_sys", &def.apis[0].functions[0], None)
+            .expect("facade");
         let facade = String::from_utf8(buf).unwrap();
 
         let Some(rustc) = find_rustc() else {
@@ -7365,7 +7473,7 @@ mod tests {
         );
         let mut buf = Vec::new();
         let sdef = def.structs.iter().find(|s| s.is_mirror()).expect("mirror");
-        RustGen::generate_mirror_struct(&mut buf, sdef).expect("mirror");
+        RustGen::generate_mirror_struct(&mut buf, "flowi_sys", sdef).expect("mirror");
         let mirror = String::from_utf8(buf).unwrap();
         assert!(mirror.contains("show: true,"), "bool default: {mirror}");
         assert!(
@@ -7392,7 +7500,7 @@ mod tests {
 
         let mut buf = Vec::new();
         let sdef = def.structs.iter().find(|s| s.is_mirror()).expect("mirror");
-        RustGen::generate_mirror_struct(&mut buf, sdef).expect("mirror");
+        RustGen::generate_mirror_struct(&mut buf, "flowi_sys", sdef).expect("mirror");
         let mirror = String::from_utf8(buf).unwrap();
 
         assert!(
@@ -7410,7 +7518,8 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        RustGen::generate_facade_fn(&mut buf, &def.apis[0].functions[0], None).expect("facade");
+        RustGen::generate_facade_fn(&mut buf, "flowi_sys", &def.apis[0].functions[0], None)
+            .expect("facade");
         let facade = String::from_utf8(buf).unwrap();
         assert!(
             facade.contains("pub fn open(config: crate::generated::plain_config::PlainConfig)"),
@@ -7507,5 +7616,104 @@ mod tests {
         let mut buf = Vec::new();
         RustGen::generate_enum_lookups(&mut buf, &api_def.enums[0]).expect("emit");
         assert!(buf.is_empty());
+    }
+
+    /// Emit one def through `generate` / `generate_facade` into a per-test temp dir and
+    /// read the file back.
+    fn emit_to_temp(tag: &str, def: &ApiDef, facade: bool, root: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("api_gen_{}_{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        let dir_s = dir.to_str().unwrap();
+        if facade {
+            RustGen::generate_facade(dir_s, def, "scripts/gen.sh", None, root).expect("facade");
+        } else {
+            let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(def));
+            RustGen::generate(dir_s, def, &reg, "scripts/gen.sh", root).expect("raw");
+        }
+        let out = std::fs::read_to_string(dir.join(format!("{}.rs", def.base_filename)))
+            .expect("read output");
+        std::fs::remove_dir_all(&dir).ok();
+        out
+    }
+
+    const ROOT_DEF: &str = "#[module(render)]\nmod image\n\
+         callback Visit(user_data: *void, name: String) -> bool\n\
+         struct Color { r: u32 }\n\
+         struct Label { text: String, color: Color, on_visit: Visit }\n\
+         api Painter { text(x: f32, text: String, color: Color) -> Label }";
+
+    /// The raw tree names flat-re-exported types through the configured root: the string
+    /// type, every named type and the `mod` imports.
+    #[test]
+    fn raw_tree_spells_types_through_the_configured_root() {
+        let def = parse_one(ROOT_DEF, "painter.def");
+        let sys = emit_to_temp("raw_root_sys", &def, false, "crate::sys");
+        for want in [
+            "use crate::sys::image::*;",
+            "crate::sys::RawStr",
+            "crate::sys::Color",
+            "crate::sys::Visit",
+        ] {
+            assert!(sys.contains(want), "{want}: {sys}");
+        }
+        assert!(!sys.contains("crate::RawStr"), "{sys}");
+        assert!(!sys.contains("crate::Color"), "{sys}");
+        assert!(!sys.contains("use crate::image"), "{sys}");
+
+        let default = emit_to_temp("raw_root_default", &def, false, "crate");
+        assert!(default.contains("crate::RawStr"), "{default}");
+        assert!(default.contains("use crate::image::*;"), "{default}");
+        assert!(!default.contains("crate::sys"), "{default}");
+    }
+
+    const RAW_PATH_DEF: &str = "#[attributes(Mirror)]\n\
+         struct PanelConfig { title: String, size: f32, }\n\
+         struct Owned { x: u32 }\n\
+         #[attributes(Opaque)]\n\
+         struct App {}\n\
+         api Gadget {\n\
+             poke(x: u32)\n\
+             name(label: String, config: PanelConfig) -> bool\n\
+             names(labels: [*const String])\n\
+             [borrowed] hold(label: String)\n\
+             [status] parse(base: u64, out: *u64) -> i32\n\
+             try_peek(key: u64, out: *u32) -> bool\n\
+             [scope_begin] begin(id: u32)\n\
+             [scope_end] end()\n\
+         }\n\
+         api Widget {\n\
+             [drop] destroy(state: *void)\n\
+             clear(state: *void)\n\
+             [rename(show)] show(label: String, state: *void) -> bool\n\
+         }\n\
+         api Shell {\n\
+             [drop] destroy(app: *App)\n\
+             set_zoom(app: *App, zoom: f32)\n\
+         }";
+
+    /// The façade names the raw bindings through the configured path everywhere - calls,
+    /// types, mirror twins and their docs - and never through the default.
+    #[test]
+    fn facade_names_the_raw_bindings_through_the_configured_path() {
+        let def = parse_one(RAW_PATH_DEF, "gadget.def");
+        let custom = emit_to_temp("facade_raw_custom", &def, true, "crate::sys");
+        assert!(!custom.contains("flowi_sys"), "{custom}");
+        for want in [
+            "crate::sys::fl_gadget_poke(",
+            "crate::sys::fl_frame_str(",
+            "crate::sys::fl_frame_str_array(",
+            "crate::sys::RawStr::borrow(",
+            "crate::sys::fl_widget_destroy(self.handle)",
+            "crate::sys::fl_shell_destroy(self.handle)",
+            "*mut crate::sys::App",
+            "The safe twin of [`crate::sys::PanelConfig`]",
+            "fn to_sys(self) -> crate::sys::PanelConfig",
+        ] {
+            assert!(custom.contains(want), "{want}: {custom}");
+        }
+
+        let default = emit_to_temp("facade_raw_default", &def, true, "flowi_sys");
+        assert!(default.contains("flowi_sys::fl_gadget_poke("), "{default}");
+        assert!(!default.contains("crate::sys"), "{default}");
     }
 }

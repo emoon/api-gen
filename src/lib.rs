@@ -127,10 +127,17 @@ pub struct Config {
     pub reference_dirs: Vec<PathBuf>,
     /// Raw Rust FFI output dir (Flowi: rust/flowi_sys/src/generated).
     pub rust_dir: Option<PathBuf>,
+    /// Rust module path that the raw bindings tree (`rust_dir`) uses to name types
+    /// re-exported flat at the root of the raw bindings, e.g. `Some("crate::sys")`.
+    /// None keeps `crate`.
+    pub rust_root: Option<String>,
     /// C public-header root; per-module subdir created on demand.
     pub c_include_root: Option<PathBuf>,
     /// Ergonomic Rust façade output dir. None skips façade generation.
     pub facade_dir: Option<PathBuf>,
+    /// Rust path under which the façade (`facade_dir`) names the raw bindings, e.g.
+    /// `Some("crate::sys")`. None keeps `flowi_sys`.
+    pub facade_raw_path: Option<String>,
     /// Rust path of the guard function (`crate::frame_thread::frame_thread_guard`) every façade
     /// forwarder of a `#[frame_context]` api block calls first, as
     /// `let _frame = <path>("<Block>::<fn>");`. It takes the entry-point name and returns a
@@ -437,7 +444,14 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
     let mut service_wrapper_modules: Vec<String> = Vec::new();
     for api_def in &emitted {
         if let Some(rust_dir) = &cfg.rust_dir {
-            RustGen::generate(utf8(rust_dir)?, api_def, &registry, gen_script(cfg)).map_err(io(
+            RustGen::generate(
+                utf8(rust_dir)?,
+                api_def,
+                &registry,
+                gen_script(cfg),
+                cfg.rust_root.as_deref().unwrap_or("crate"),
+            )
+            .map_err(io(
                 &format!("writing Rust for {} into", api_def.base_filename),
                 rust_dir,
             ))?;
@@ -468,6 +482,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
                 api_def,
                 gen_script(cfg),
                 cfg.facade_frame_guard.as_deref(),
+                cfg.facade_raw_path.as_deref().unwrap_or("flowi_sys"),
             )
             .map_err(io(
                 &format!("writing the façade for {} into", api_def.base_filename),
@@ -667,8 +682,10 @@ mod tests {
             api_dir,
             reference_dirs: Vec::new(),
             rust_dir: None,
+            rust_root: None,
             c_include_root: None,
             facade_dir: None,
+            facade_raw_path: None,
             facade_frame_guard: None,
             service_wrapper_dir: Some(wrapper_dir.clone()),
             service_wrapper_raw_path: None,

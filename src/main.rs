@@ -10,8 +10,10 @@ fn main() {
     let mut api_dir = None;
     let mut reference_dirs = Vec::new();
     let mut rust_dir = None;
+    let mut rust_root = None;
     let mut c_include_root = None;
     let mut facade_dir = None;
+    let mut facade_raw_path = None;
     let mut facade_frame_guard = None;
     let mut service_wrapper_dir = None;
     let mut service_wrapper_raw_path = None;
@@ -52,8 +54,10 @@ fn main() {
             "--api-dir" => api_dir = Some(PathBuf::from(val())),
             "--reference-dir" => reference_dirs.push(PathBuf::from(val())),
             "--rust-dir" => rust_dir = Some(PathBuf::from(val())),
+            "--rust-root" => rust_root = Some(val()),
             "--c-include-root" => c_include_root = Some(PathBuf::from(val())),
             "--facade-dir" => facade_dir = Some(PathBuf::from(val())),
+            "--facade-raw-path" => facade_raw_path = Some(val()),
             "--facade-frame-guard" => facade_frame_guard = Some(val()),
             "--service-wrapper-dir" => service_wrapper_dir = Some(PathBuf::from(val())),
             "--service-wrapper-raw-path" => service_wrapper_raw_path = Some(val()),
@@ -97,8 +101,10 @@ fn main() {
         api_dir: api_dir.expect("--api-dir required"),
         reference_dirs,
         rust_dir,
+        rust_root,
         c_include_root,
         facade_dir,
+        facade_raw_path,
         facade_frame_guard,
         service_wrapper_dir,
         service_wrapper_raw_path,
