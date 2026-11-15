@@ -505,6 +505,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
                 gen_script(cfg),
                 cfg.facade_frame_guard.as_deref(),
                 cfg.facade_raw_path.as_deref().unwrap_or("flowi_sys"),
+                &doc_refs,
             )
             .map_err(io(
                 &format!("writing the façade for {} into", api_def.base_filename),

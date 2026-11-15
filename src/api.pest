@@ -122,7 +122,7 @@ apifnlist = { (doc_comment | apifn)* }
 // the C prototype, call macro, and export entry are emitted as usual, but no
 // Rust binding or wrapper — the marker comes off when a Rust consumer arrives.
 // None of these markers alter the C / sys output.
-apifn     = { (manual_typ | drop_typ | const_typ | rename_typ | scope_begin_typ | scope_end_typ | borrowed_typ | retained_typ | transfer_typ | status_typ | thread_safe_typ | c_only_typ | frame_typ)* ~ name ~ ("(") ~ apiargs? ~ (")") ~ retexp? }
+apifn     = { (manual_typ | drop_typ | const_typ | rename_typ | rust_doc_typ | scope_begin_typ | scope_end_typ | borrowed_typ | retained_typ | transfer_typ | status_typ | thread_safe_typ | c_only_typ | frame_typ)* ~ name ~ ("(") ~ apiargs? ~ (")") ~ retexp? }
 apiargs   = { apiarg ~ ((",") ~ apiarg)* }
 // A `[slice(T)]` / `[slice_mut(T)]` data arg and its immediately-following
 // count arg collapse to one `&[T]` / `&mut [T]` Rust façade param (`slice_arg`,
@@ -204,6 +204,7 @@ slice_mut_typ = { ("[slice_mut(") ~ vtype ~ (")]") }
 static_typ   = { ("[static]") }
 const_typ    = { ("[const]") }
 rename_typ   = { ("[rename(") ~ name ~ (")]") }
+rust_doc_typ = { ("[rust_doc(") ~ path ~ (")]") }
 // `[scope_begin]` drives the Rust scope-guard façade.
 scope_begin_typ = { ("[scope_begin]") }
 scope_end_typ   = { ("[scope_end]") }

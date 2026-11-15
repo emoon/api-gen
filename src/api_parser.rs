@@ -251,6 +251,10 @@ pub struct Function {
     /// `[rename(<name>)]`: override the emitted Rust method name. The c_name keeps
     /// the original slot name, so C / sys output is unaffected.
     pub rename: Option<String>,
+    /// `[rust_doc(<Type::name>)]`: the hand-written Rust item a doc comment
+    /// reference to this function names in the Rust façade docs. C output is
+    /// unaffected.
+    pub rust_doc: Option<String>,
     /// `[scope_begin]`: this api slot opens a thread-local scope. The Rust façade
     /// emits it returning a `<Domain>Scope` guard whose Drop calls the paired
     /// `[scope_end]` slot. C / sys output is unaffected.
@@ -311,6 +315,7 @@ impl Default for Function {
             is_drop: false,
             is_const: false,
             rename: None,
+            rust_doc: None,
             is_scope_begin: false,
             is_scope_end: false,
             is_borrowed: false,
@@ -1206,6 +1211,9 @@ impl ApiParser {
                 Rule::frame_typ => function.is_frame = true,
                 Rule::rename_typ => {
                     function.rename = Self::first_child_str(entry, Rule::name);
+                }
+                Rule::rust_doc_typ => {
+                    function.rust_doc = Self::first_child_str(entry, Rule::path);
                 }
                 Rule::name if function.name.is_empty() => function.name = entry.as_str().to_owned(),
                 Rule::apiargs => {

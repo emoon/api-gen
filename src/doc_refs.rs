@@ -1,15 +1,19 @@
 //! References between items in doc comments. A `.def` comment names another item by
-//! its IDL spelling in backticks; the C header shows the name a C caller writes.
+//! its IDL spelling in backticks; the C header shows the name a C caller writes, and
+//! the Rust façade shows the hand-written Rust name of a `[rust_doc]` function.
 
 use crate::api_parser::{ApiDef, Enum, Struct};
 use crate::naming::Naming;
 use std::collections::{HashMap, HashSet};
 
-/// Every item a doc comment can name, with its C spelling.
+/// Every item a doc comment can name, with its C spelling and, where one is given,
+/// its Rust spelling.
 #[derive(Debug, Default)]
 pub struct DocRefs {
     /// IDL reference (`List::begin`, `ListResult`, `ListResult.requests`) to C spelling.
     c_names: HashMap<String, String>,
+    /// IDL reference to Rust spelling, for the api functions marked `[rust_doc]`.
+    rust_names: HashMap<String, String>,
     /// Names of the types and api blocks, which own the members a reference can name.
     owners: HashSet<String>,
 }
@@ -27,10 +31,12 @@ impl DocRefs {
             for api in &def.apis {
                 refs.owners.insert(api.name.clone());
                 for func in &api.functions {
-                    refs.c_names.insert(
-                        format!("{}::{}", api.name, func.name),
-                        crate::c_gen::c_call_name(api, func),
-                    );
+                    let idl_name = format!("{}::{}", api.name, func.name);
+                    if let Some(rust_name) = &func.rust_doc {
+                        refs.rust_names.insert(idl_name.clone(), rust_name.clone());
+                    }
+                    refs.c_names
+                        .insert(idl_name, crate::c_gen::c_call_name(api, func));
                 }
             }
             for cb in &def.callbacks {
@@ -101,33 +107,42 @@ impl DocRefs {
 
     /// header with the references in its comment lines replaced by their C spelling.
     pub fn to_c(&self, header: &str) -> String {
-        let mut out = String::with_capacity(header.len());
-        for line in header.split_inclusive('\n') {
-            if line.trim_start().starts_with("//") {
-                out.push_str(&self.line_to_c(line));
-            } else {
-                out.push_str(line);
-            }
-        }
-        out
+        translate(header, "//", &self.c_names)
     }
 
-    fn line_to_c(&self, line: &str) -> String {
-        let mut out = String::with_capacity(line.len());
-        for (i, (span, quoted)) in spans(line).enumerate() {
-            if i > 0 {
-                out.push('`');
-            }
-            let name = call_target(span);
-            match self.c_names.get(name) {
-                Some(c_name) if quoted => {
-                    out.push_str(c_name);
-                    out.push_str(&span[name.len()..]);
-                }
-                _ => out.push_str(span),
-            }
+    /// source with the references in its doc comment lines replaced by their Rust
+    /// spelling. Only references to `[rust_doc]` functions change.
+    pub fn to_rust(&self, source: &str) -> String {
+        translate(source, "///", &self.rust_names)
+    }
+}
+
+/// text with the references in the lines that start with marker replaced through names.
+fn translate(text: &str, marker: &str, names: &HashMap<String, String>) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with(marker) {
+            translate_line(line, names, &mut out);
+        } else {
+            out.push_str(line);
         }
-        out
+    }
+    out
+}
+
+fn translate_line(line: &str, names: &HashMap<String, String>, out: &mut String) {
+    for (i, (span, quoted)) in spans(line).enumerate() {
+        if i > 0 {
+            out.push('`');
+        }
+        let name = call_target(span);
+        match names.get(name) {
+            Some(new_name) if quoted => {
+                out.push_str(new_name);
+                out.push_str(&span[name.len()..]);
+            }
+            _ => out.push_str(span),
+        }
     }
 }
 
@@ -248,6 +263,29 @@ mod tests {
             "// Call `fl_list_begin`, read `FlListResult.requests` of a `FlListResult`.\n\
              // `FlDropRelationship_Before`, `fl_list_end()` and `count`.\n\
              // `fl_list_show`, `fl_list_raw_impl`, `FlBackend.poll`, `FlEvent.key`.\n"
+        );
+    }
+
+    #[test]
+    fn doc_lines_name_the_rust_spelling() {
+        let defs = parse(
+            "api Input {
+                 [manual] [rust_doc(List::show)] list(count: u32)
+                 [rename(text)] get_text() -> u32
+                 [manual] [rust_doc(Field::edit)] show_impl()
+                 hot_id() -> u64
+             }",
+        );
+        let source = "/// See `Input::list`, `Input::get_text()` and `Input::show_impl`.\n\
+                      \x20   /// `Input::hot_id` and Input::list stay.\n\
+                      // `Input::list`\n\
+                      let s = \"`Input::list`\";\n";
+        assert_eq!(
+            refs(&defs).to_rust(source),
+            "/// See `List::show`, `Input::get_text()` and `Field::edit`.\n\
+             \x20   /// `Input::hot_id` and Input::list stay.\n\
+             // `Input::list`\n\
+             let s = \"`Input::list`\";\n"
         );
     }
 
