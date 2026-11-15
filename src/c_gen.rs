@@ -12,9 +12,8 @@ use crate::api_parser::*;
 use crate::naming::Naming;
 use heck::ToSnakeCase;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 pub struct Cgen;
 
@@ -51,7 +50,7 @@ impl Cgen {
         let module_dir = format!("{}/{}", c_include_root, api_def.module.as_str());
         std::fs::create_dir_all(&module_dir)?;
         let filename = format!("{}/{}.h", module_dir, api_def.base_filename);
-        let mut f = BufWriter::new(File::create(&filename)?);
+        let mut f: Vec<u8> = Vec::new();
 
         let fwd_decl_structs = Self::structs_needing_forward_decl(api_def);
 
@@ -137,7 +136,7 @@ impl Cgen {
             writeln!(f, "#endif")?;
         }
 
-        Ok(())
+        std::fs::write(&filename, f)
     }
 
     /// Emit a def's real types into its header, in the one order C accepts: enums,
