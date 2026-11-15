@@ -1,16 +1,18 @@
 //! References between items in doc comments. A `.def` comment names another item by
-//! its IDL spelling in backticks; the C header shows the name a C caller writes.
+//! its IDL spelling in backticks; the C header shows the name a C caller writes, and
+//! the Rust façade shows the hand-written Rust name of a `[rust_doc]` function.
 
-use crate::api_parser::{Api, ApiDef, Enum, Function, Struct};
+use crate::api_parser::{ApiDef, Enum, Struct};
 use crate::naming::Naming;
 use std::collections::{HashMap, HashSet};
 
-/// Every item a doc comment can name, with its C spelling.
+/// Every item a doc comment can name, with its C spelling and, where one is given,
+/// its Rust spelling.
 #[derive(Debug, Default)]
 pub struct DocRefs {
     /// IDL reference (`List::begin`, `ListResult`, `ListResult.requests`) to C spelling.
     c_names: HashMap<String, String>,
-    /// IDL reference to Rust spelling, for the api functions Rust names differently.
+    /// IDL reference to Rust spelling, for the api functions marked `[rust_doc]`.
     rust_names: HashMap<String, String>,
     /// Names of the types and api blocks, which own the members a reference can name.
     owners: HashSet<String>,
@@ -30,8 +32,8 @@ impl DocRefs {
                 refs.owners.insert(api.name.clone());
                 for func in &api.functions {
                     let idl_name = format!("{}::{}", api.name, func.name);
-                    if let Some(rust_name) = rust_name(api, func) {
-                        refs.rust_names.insert(idl_name.clone(), rust_name);
+                    if let Some(rust_name) = &func.rust_doc {
+                        refs.rust_names.insert(idl_name.clone(), rust_name.clone());
                     }
                     refs.c_names
                         .insert(idl_name, crate::c_gen::c_call_name(api, func));
@@ -109,16 +111,10 @@ impl DocRefs {
     }
 
     /// source with the references in its doc comment lines replaced by their Rust
-    /// spelling. Only api functions that Rust names differently change.
+    /// spelling. Only references to `[rust_doc]` functions change.
     pub fn to_rust(&self, source: &str) -> String {
         translate(source, "///", &self.rust_names)
     }
-}
-
-/// The Rust item a reference to func names, when it is not the IDL name.
-fn rust_name(api: &Api, func: &Function) -> Option<String> {
-    let renamed = || Some(format!("{}::{}", api.name, func.rename.as_ref()?));
-    func.rust_doc.clone().or_else(renamed)
 }
 
 /// text with the references in the lines that start with marker replaced through names.
@@ -276,7 +272,7 @@ mod tests {
             "api Input {
                  [manual] [rust_doc(List::show)] list(count: u32)
                  [rename(text)] get_text() -> u32
-                 [manual] [rename(show)] [rust_doc(Field::edit)] show_impl()
+                 [manual] [rust_doc(Field::edit)] show_impl()
                  hot_id() -> u64
              }",
         );
@@ -286,7 +282,7 @@ mod tests {
                       let s = \"`Input::list`\";\n";
         assert_eq!(
             refs(&defs).to_rust(source),
-            "/// See `List::show`, `Input::text()` and `Field::edit`.\n\
+            "/// See `List::show`, `Input::get_text()` and `Field::edit`.\n\
              \x20   /// `Input::hot_id` and Input::list stay.\n\
              // `Input::list`\n\
              let s = \"`Input::list`\";\n"
