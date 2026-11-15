@@ -1281,9 +1281,10 @@ impl RustGen {
         reg: &TypeRegistry,
         script: &str,
         root: &str,
+        doc_refs: &crate::doc_refs::DocRefs,
     ) -> io::Result<()> {
         let filename = format!("{}/{}.rs", rust_dir, api_def.base_filename);
-        let mut f = BufWriter::new(File::create(&filename)?);
+        let mut f: Vec<u8> = Vec::new();
 
         write!(f, "{}", crate::emit_util::header(script))?;
         writeln!(f)?;
@@ -1342,7 +1343,8 @@ impl RustGen {
             Self::generate_api_externs(&mut f, root, api)?;
         }
 
-        Ok(())
+        let source = String::from_utf8(f).expect("api_gen: raw binding output is UTF-8");
+        std::fs::write(&filename, doc_refs.to_sys(&source))
     }
 
     /// Emit an `api <Domain>` block as an extern "C" block declaring its direct
@@ -1355,7 +1357,7 @@ impl RustGen {
         let mut funcs = api
             .functions
             .iter()
-            .filter(|func| !func.has_varargs && !func.is_c_only)
+            .filter(|func| Self::raw_declares(func))
             .peekable();
         if funcs.peek().is_none() {
             // A domain with only varargs slots has no Rust-callable surface.
@@ -1475,7 +1477,7 @@ impl RustGen {
     /// Façade method name for a slot: the slot name with a trailing _impl
     /// dropped (a C body-name suffix that should not leak into the Rust API, e.g.
     /// the menu domain's begin_impl -> begin). Otherwise verbatim.
-    fn facade_method_name(slot: &str) -> &str {
+    pub(crate) fn facade_method_name(slot: &str) -> &str {
         slot.strip_suffix("_impl").unwrap_or(slot)
     }
 
@@ -1549,6 +1551,27 @@ impl RustGen {
     /// legal caller. Such slots stay raw-FFI-only in flowi_sys.
     fn has_extern_opaque_arg(func: &Function) -> bool {
         func.function_args.iter().any(|a| a.is_extern_opaque)
+    }
+
+    /// Whether the raw bindings declare func: a varargs or `[c_only]` slot has no
+    /// Rust-callable form.
+    pub(crate) fn raw_declares(func: &Function) -> bool {
+        !func.has_varargs && !func.is_c_only
+    }
+
+    /// The slots the stateless façade of api emits as methods. A service block and a
+    /// block with a `[drop]` slot have none, and a `[transfer]` destroy slot is never
+    /// one.
+    pub(crate) fn stateless_methods(api: &Api) -> impl Iterator<Item = &Function> {
+        let destroy: std::collections::HashSet<&str> = api
+            .functions
+            .iter()
+            .filter_map(|func| func.transfer_free.as_deref())
+            .collect();
+        let stateless = !api.is_service && Self::api_drop_fn(api).is_none();
+        api.functions.iter().filter(move |func| {
+            stateless && Self::facade_generates(func) && !destroy.contains(func.name.as_str())
+        })
     }
 
     /// Whether a slot gets a generated façade method: skip the hand-written
@@ -2589,11 +2612,6 @@ impl RustGen {
             if api.is_service {
                 continue;
             }
-            let destroy: std::collections::HashSet<&str> = api
-                .functions
-                .iter()
-                .filter_map(|func| func.transfer_free.as_deref())
-                .collect();
             let transfer_pairs = Self::validate_transfer_api(api)
                 .unwrap_or_else(|diag| panic!("api_gen: façade `{}`: {}", api.name, diag));
             let mut seen_owned = std::collections::HashSet::new();
@@ -2651,9 +2669,7 @@ impl RustGen {
             writeln!(f)?;
             writeln!(f, "impl {} {{", api.name)?;
             let mut first = true;
-            for func in api.functions.iter().filter(|func| {
-                Self::facade_generates(func) && !destroy.contains(func.name.as_str())
-            }) {
+            for func in Self::stateless_methods(api) {
                 if !first {
                     writeln!(f)?;
                 }
@@ -3727,7 +3743,15 @@ mod tests {
             "arena.def",
         );
         let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(&svc));
-        RustGen::generate(dir_s, &svc, &reg, "scripts/gen.sh", "crate").expect("generate svc");
+        RustGen::generate(
+            dir_s,
+            &svc,
+            &reg,
+            "scripts/gen.sh",
+            "crate",
+            &crate::doc_refs::DocRefs::default(),
+        )
+        .expect("generate svc");
         let svc_rs = std::fs::read_to_string(dir.join("arena.rs")).expect("read svc rs");
         assert!(
             svc_rs.contains("extern \"C\" {")
@@ -3749,7 +3773,15 @@ mod tests {
             "arena.def",
         );
         let reg2 = crate::layout::TypeRegistry::build(std::slice::from_ref(&plain));
-        RustGen::generate(dir_s, &plain, &reg2, "scripts/gen.sh", "crate").expect("generate plain");
+        RustGen::generate(
+            dir_s,
+            &plain,
+            &reg2,
+            "scripts/gen.sh",
+            "crate",
+            &crate::doc_refs::DocRefs::default(),
+        )
+        .expect("generate plain");
         let plain_rs = std::fs::read_to_string(dir.join("arena.rs")).expect("read plain rs");
         assert!(
             plain_rs.contains("pub fn fl_arena_rewind(arena: *mut crate::Arena);"),
@@ -7626,6 +7658,36 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    #[test]
+    fn raw_binding_comments_name_the_declared_function() {
+        let def = parse_one(
+            "/// The status of a call.
+             #[attributes(error_enum)]
+             enum Status { Success = 0, Failed = 1, }
+             struct ThingConfig { gap: f32 }
+             /// Call `Thing::run_impl`, then `Thing::stop`.
+             api Thing {
+                 /// Takes a `ThingConfig`. Returns a `Status`. See `Thing::stop` and `Thing::log`.
+                 run_impl(config: ThingConfig) -> Status
+                 stop()
+                 log(format: *const char, ...)
+             }",
+            "thing.def",
+        );
+        let out = emit_to_temp("raw_doc_refs", &def, false, "crate");
+        assert!(
+            out.contains("// Call `fl_thing_run_impl`, then `fl_thing_stop`."),
+            "the block comment names the declared functions: {out}"
+        );
+        assert!(
+            out.contains(
+                "/// Takes a `ThingConfig`. Returns a `Status`. See `fl_thing_stop` and `Thing::log`."
+            ),
+            "types and the undeclared varargs slot keep their name: {out}"
+        );
+        assert!(!out.contains("FlStatus"), "no C type name leaks in: {out}");
+    }
+
     /// Emit one def through `generate` / `generate_facade` into a per-test temp dir and
     /// read the file back.
     fn emit_to_temp(tag: &str, def: &ApiDef, facade: bool, root: &str) -> String {
@@ -7644,7 +7706,15 @@ mod tests {
             .expect("facade");
         } else {
             let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(def));
-            RustGen::generate(dir_s, def, &reg, "scripts/gen.sh", root).expect("raw");
+            RustGen::generate(
+                dir_s,
+                def,
+                &reg,
+                "scripts/gen.sh",
+                root,
+                &crate::doc_refs::DocRefs::new(std::slice::from_ref(def), &crate::naming::FL),
+            )
+            .expect("raw");
         }
         let out = std::fs::read_to_string(dir.join(format!("{}.rs", def.base_filename)))
             .expect("read output");
