@@ -2556,6 +2556,7 @@ impl RustGen {
         script: &str,
         frame_guard: Option<&str>,
         raw: &str,
+        doc_refs: &crate::doc_refs::DocRefs,
     ) -> io::Result<bool> {
         // A `#[attributes(service)]` block has no direct-link façade: the
         // external-consumer wrapper pass owns that surface.
@@ -2676,6 +2677,7 @@ impl RustGen {
         }
 
         let body = String::from_utf8(body).expect("api_gen: façade output is UTF-8");
+        let body = doc_refs.to_rust(&body);
         let filename = format!("{}/{}.rs", fl_ui_gen_dir, api_def.base_filename);
         let mut out = BufWriter::new(File::create(&filename)?);
         write!(out, "{}{}", Self::generated_header(&body, script), body)?;
@@ -3792,6 +3794,7 @@ mod tests {
                 "scripts/gen.sh",
                 path,
                 "flowi_sys",
+                &crate::doc_refs::DocRefs::default(),
             )
             .expect("facade");
             std::fs::read_to_string(dir.join("gadget.rs")).expect("read facade")
@@ -3837,6 +3840,7 @@ mod tests {
             "scripts/gen.sh",
             path,
             "flowi_sys",
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("facade");
         std::fs::read_to_string(dir.join("gadget.rs")).expect("read facade")
@@ -3939,7 +3943,8 @@ mod tests {
             &api_def,
             "scripts/gen.sh",
             None,
-            "flowi_sys"
+            "flowi_sys",
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("facade"));
         let out = std::fs::read_to_string(dir.join("theme.rs")).expect("read facade");
@@ -5740,7 +5745,8 @@ mod tests {
             &def,
             "scripts/gen.sh",
             None,
-            "flowi_sys"
+            "flowi_sys",
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("generate façade"));
         let out = std::fs::read_to_string(dir.join("gadget.rs")).expect("read façade");
@@ -5882,7 +5888,8 @@ mod tests {
             &def,
             "scripts/gen.sh",
             None,
-            "flowi_sys"
+            "flowi_sys",
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("generate façade"));
         let out = std::fs::read_to_string(dir.join("cursor.rs")).expect("read façade");
@@ -5917,7 +5924,8 @@ mod tests {
             &def,
             "scripts/gen.sh",
             None,
-            "flowi_sys"
+            "flowi_sys",
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("generate façade"));
         let out = std::fs::read_to_string(dir.join("store.rs")).expect("read façade");
@@ -7625,7 +7633,15 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("mk dir");
         let dir_s = dir.to_str().unwrap();
         if facade {
-            RustGen::generate_facade(dir_s, def, "scripts/gen.sh", None, root).expect("facade");
+            RustGen::generate_facade(
+                dir_s,
+                def,
+                "scripts/gen.sh",
+                None,
+                root,
+                &crate::doc_refs::DocRefs::default(),
+            )
+            .expect("facade");
         } else {
             let reg = crate::layout::TypeRegistry::build(std::slice::from_ref(def));
             RustGen::generate(dir_s, def, &reg, "scripts/gen.sh", root).expect("raw");
