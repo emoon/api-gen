@@ -472,6 +472,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
                 &registry,
                 gen_script(cfg),
                 cfg.rust_root.as_deref().unwrap_or("crate"),
+                &doc_refs,
             )
             .map_err(io(
                 &format!("writing Rust for {} into", api_def.base_filename),

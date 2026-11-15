@@ -1,9 +1,11 @@
 //! References between items in doc comments. A `.def` comment names another item by
-//! its IDL spelling in backticks; the C header shows the name a C caller writes, and
-//! the Rust façade shows the hand-written Rust name of a `[rust_doc]` function.
+//! its IDL spelling in backticks; the C header shows the name a C caller writes, the
+//! raw Rust bindings show the linked C name, and the Rust façade shows the Rust name
+//! of a function whose method is named otherwise.
 
-use crate::api_parser::{ApiDef, Enum, Struct};
+use crate::api_parser::{Api, ApiDef, Enum, Struct};
 use crate::naming::Naming;
+use crate::rust_gen::RustGen;
 use std::collections::{HashMap, HashSet};
 
 /// Every item a doc comment can name, with its C spelling and, where one is given,
@@ -12,8 +14,11 @@ use std::collections::{HashMap, HashSet};
 pub struct DocRefs {
     /// IDL reference (`List::begin`, `ListResult`, `ListResult.requests`) to C spelling.
     c_names: HashMap<String, String>,
-    /// IDL reference to Rust spelling, for the api functions marked `[rust_doc]`.
+    /// IDL reference to Rust spelling, for the api functions whose façade method has
+    /// another name: the ones marked `[rust_doc]` and the generated `_impl` ones.
     rust_names: HashMap<String, String>,
+    /// IDL reference to the C function the raw Rust bindings declare for it.
+    sys_names: HashMap<String, String>,
     /// Names of the types and api blocks, which own the members a reference can name.
     owners: HashSet<String>,
 }
@@ -21,6 +26,8 @@ pub struct DocRefs {
 impl DocRefs {
     pub fn new(api_defs: &[ApiDef], naming: &Naming) -> DocRefs {
         let mut refs = DocRefs::default();
+        refs.c_names
+            .insert("String".to_owned(), naming.c_string_type());
         for def in api_defs {
             for s in &def.structs {
                 refs.add_struct(s, naming);
@@ -30,10 +37,11 @@ impl DocRefs {
             }
             for api in &def.apis {
                 refs.owners.insert(api.name.clone());
+                refs.add_rust_names(api);
                 for func in &api.functions {
                     let idl_name = format!("{}::{}", api.name, func.name);
-                    if let Some(rust_name) = &func.rust_doc {
-                        refs.rust_names.insert(idl_name.clone(), rust_name.clone());
+                    if RustGen::raw_declares(func) {
+                        refs.sys_names.insert(idl_name.clone(), func.c_name.clone());
                     }
                     refs.c_names
                         .insert(idl_name, crate::c_gen::c_call_name(api, func));
@@ -111,9 +119,36 @@ impl DocRefs {
     }
 
     /// source with the references in its doc comment lines replaced by their Rust
-    /// spelling. Only references to `[rust_doc]` functions change.
+    /// spelling. Only references to functions whose method is named otherwise change.
     pub fn to_rust(&self, source: &str) -> String {
         translate(source, "///", &self.rust_names)
+    }
+
+    /// source with the function references in its comment lines replaced by the C
+    /// function the raw bindings declare. Types keep their name there, and an api
+    /// block's comment is a plain `//` one.
+    pub fn to_sys(&self, source: &str) -> String {
+        translate(source, "//", &self.sys_names)
+    }
+
+    /// The Rust spelling of the functions in api whose façade method is not named as
+    /// the function: a generated `_impl` method, or the `[rust_doc]` name.
+    fn add_rust_names(&mut self, api: &Api) {
+        for func in RustGen::stateless_methods(api) {
+            let method = RustGen::facade_method_name(&func.name);
+            if method != func.name {
+                self.rust_names.insert(
+                    format!("{}::{}", api.name, func.name),
+                    format!("{}::{}", api.name, method),
+                );
+            }
+        }
+        for func in &api.functions {
+            if let Some(rust_name) = &func.rust_doc {
+                self.rust_names
+                    .insert(format!("{}::{}", api.name, func.name), rust_name.clone());
+            }
+        }
     }
 }
 
@@ -273,20 +308,61 @@ mod tests {
                  [manual] [rust_doc(List::show)] list(count: u32)
                  [rename(text)] get_text() -> u32
                  [manual] [rust_doc(Field::edit)] show_impl()
+                 [manual] raw_impl()
+                 open_impl(count: u32)
                  hot_id() -> u64
              }",
         );
         let source = "/// See `Input::list`, `Input::get_text()` and `Input::show_impl`.\n\
+                      /// `Input::open_impl` is generated, `Input::raw_impl` is not.\n\
                       \x20   /// `Input::hot_id` and Input::list stay.\n\
                       // `Input::list`\n\
                       let s = \"`Input::list`\";\n";
         assert_eq!(
             refs(&defs).to_rust(source),
             "/// See `List::show`, `Input::get_text()` and `Field::edit`.\n\
+             /// `Input::open` is generated, `Input::raw_impl` is not.\n\
              \x20   /// `Input::hot_id` and Input::list stay.\n\
              // `Input::list`\n\
              let s = \"`Input::list`\";\n"
         );
+    }
+
+    #[test]
+    fn only_a_stateless_generated_method_drops_impl() {
+        let defs = parse(
+            "struct Image { id: u32 }
+             api Buffer {
+                 [drop] destroy(state: *void)
+                 resize_impl(state: *void, count: u32)
+             }
+             api Loader {
+                 [transfer(free = free_impl)] load_impl() -> *Image
+                 free_impl(image: *Image)
+             }",
+        );
+        let source = "/// `Buffer::resize_impl`, `Loader::load_impl`, `Loader::free_impl`.\n";
+        assert_eq!(
+            refs(&defs).to_rust(source),
+            "/// `Buffer::resize_impl`, `Loader::load`, `Loader::free_impl`.\n"
+        );
+    }
+
+    #[test]
+    fn raw_binding_docs_name_the_linked_c_function() {
+        let defs = parse(LIST_DEF);
+        let source = "/// Call `List::begin` or `List::show_impl` with a `ListConfig`.\n\
+                      /// It takes a `String`.\n\
+                      // Then `List::end`.\n\
+                      let s = \"`List::begin`\";\n";
+        assert_eq!(
+            refs(&defs).to_sys(source),
+            "/// Call `fl_list_begin` or `fl_list_show_impl` with a `ListConfig`.\n\
+             /// It takes a `String`.\n\
+             // Then `fl_list_end`.\n\
+             let s = \"`List::begin`\";\n"
+        );
+        assert_eq!(refs(&defs).to_c("// A `String`.\n"), "// A `FlString`.\n");
     }
 
     #[test]
