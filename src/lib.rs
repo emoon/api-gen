@@ -3,6 +3,7 @@
 
 mod api_parser;
 mod c_gen;
+mod doc_refs;
 mod emit_util;
 mod inbound_gen;
 mod layout;
@@ -18,6 +19,7 @@ extern crate pest_derive;
 
 use crate::api_parser::{ApiDef, ApiParser};
 use crate::c_gen::Cgen;
+use crate::doc_refs::DocRefs;
 use crate::naming::Naming;
 use crate::rust_gen::RustGen;
 use std::collections::BTreeSet;
@@ -258,6 +260,23 @@ fn defs_in(dir: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(files)
 }
 
+/// Fail when a doc comment names a member that its type or api block does not have.
+fn check_doc_refs(doc_refs: &DocRefs, emitted: &[&ApiDef]) -> Result<(), Error> {
+    let missing: Vec<String> = emitted
+        .iter()
+        .map(|def| (def, doc_refs.unresolved(def)))
+        .filter(|(_, refs)| !refs.is_empty())
+        .map(|(def, refs)| format!("{}:\n{}", def.filename, refs.join("\n")))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Idl(format!(
+        "doc comment reference(s) name nothing in the IDL:\n{}",
+        missing.join("\n")
+    )))
+}
+
 pub fn generate(cfg: &Config) -> Result<Summary, Error> {
     let api_dir = &cfg.api_dir;
     if let Some(c_include_root) = &cfg.c_include_root {
@@ -312,6 +331,9 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
         .iter()
         .filter(|d| owned.contains(&d.base_filename))
         .collect();
+
+    let doc_refs = DocRefs::new(&api_defs, &cfg.naming);
+    check_doc_refs(&doc_refs, &emitted)?;
 
     let paired = pairing::resolve(&api_defs).map_err(|e| Error::Idl(e.to_string()))?;
     if let Some(marshal_dir) = &cfg.marshal_dir {
@@ -506,6 +528,7 @@ pub fn generate(cfg: &Config) -> Result<Summary, Error> {
                     cfg.c_layout_asserts.then_some(&registry),
                     gen_script(cfg),
                     cfg.c_spdx_license.as_deref(),
+                    &doc_refs,
                 )
                 .map_err(io(
                     &format!("writing the C header for {} into", api_def.base_filename),

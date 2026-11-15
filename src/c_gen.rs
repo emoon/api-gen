@@ -12,9 +12,8 @@ use crate::api_parser::*;
 use crate::naming::Naming;
 use heck::ToSnakeCase;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
 use std::io;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 
 pub struct Cgen;
 
@@ -47,11 +46,12 @@ impl Cgen {
         layout_asserts: Option<&crate::layout::TypeRegistry>,
         script: &str,
         spdx_license: Option<&str>,
+        doc_refs: &crate::doc_refs::DocRefs,
     ) -> io::Result<()> {
         let module_dir = format!("{}/{}", c_include_root, api_def.module.as_str());
         std::fs::create_dir_all(&module_dir)?;
         let filename = format!("{}/{}.h", module_dir, api_def.base_filename);
-        let mut f = BufWriter::new(File::create(&filename)?);
+        let mut f: Vec<u8> = Vec::new();
 
         let fwd_decl_structs = Self::structs_needing_forward_decl(api_def);
 
@@ -137,7 +137,8 @@ impl Cgen {
             writeln!(f, "#endif")?;
         }
 
-        Ok(())
+        let header = String::from_utf8(f).map_err(io::Error::other)?;
+        std::fs::write(&filename, doc_refs.to_c(&header))
     }
 
     /// Emit a def's real types into its header, in the one order C accepts: enums,
@@ -789,7 +790,7 @@ impl Cgen {
             // convenience macro would shadow the real function and rewrite
             // sb_clear(sb) into sb_clear((FlStringBuilder){ sb }), a type error.
             // The same is true of a `[scope_end]` slot on any block.
-            if !api.is_service && !func.is_scope_end && convenience_config_arg(func).is_some() {
+            if has_convenience_macro(api, func) {
                 if func.c_name.ends_with("_impl") {
                     Self::generate_convenience_macro(f, func, naming)?;
                 } else {
@@ -1005,6 +1006,22 @@ fn callback_values(api_def: &ApiDef) -> impl Iterator<Item = &Variable> {
 /// and other whole values are passed as plain expressions and never wrapped.
 const CONFIG_TYPE_SUFFIX: &str = "Config";
 
+/// Whether an api slot gets a designated-initializer convenience macro. A
+/// `#[attributes(service)]` block and a `[scope_end]` slot never do.
+fn has_convenience_macro(api: &Api, func: &Function) -> bool {
+    !api.is_service && !func.is_scope_end && convenience_config_arg(func).is_some()
+}
+
+/// The name a C caller writes to call an api slot: the convenience macro when the
+/// slot has one, which drops an `_impl` suffix, else the exported function.
+pub(crate) fn c_call_name(api: &Api, func: &Function) -> String {
+    if has_convenience_macro(api, func) {
+        Cgen::convenience_call_macro_name(func)
+    } else {
+        func.c_name.clone()
+    }
+}
+
 /// The trailing by-value config struct of an api slot, if any - the arg a
 /// designated-initializer convenience macro builds from __VA_ARGS__. It is the
 /// last non-self arg and must be a by-value generated struct named *Config:
@@ -1148,6 +1165,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("generate header");
 
@@ -1590,6 +1608,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join(api_def.module.as_str()).join("settings.h"))
@@ -2655,6 +2674,7 @@ mod tests {
                 None,
                 "scripts/gen.sh",
                 license,
+                &crate::doc_refs::DocRefs::default(),
             )
             .expect("header");
             std::fs::read_to_string(dir.join("lic").join("lic.h")).expect("read lic.h")
@@ -2703,6 +2723,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("view").join("view.h")).expect("read view.h");
@@ -2757,6 +2778,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("view").join("view.h")).expect("read view.h");
@@ -2820,6 +2842,7 @@ mod tests {
                 asserts,
                 "scripts/gen.sh",
                 None,
+                &crate::doc_refs::DocRefs::default(),
             )
             .expect("header");
             std::fs::read_to_string(dir.join("pin").join("pin.h")).expect("read pin.h")
@@ -2884,6 +2907,7 @@ mod tests {
             Some(&registry),
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("pin").join("pin.h")).expect("read pin.h");
