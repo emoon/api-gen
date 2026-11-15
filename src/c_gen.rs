@@ -46,6 +46,7 @@ impl Cgen {
         layout_asserts: Option<&crate::layout::TypeRegistry>,
         script: &str,
         spdx_license: Option<&str>,
+        doc_refs: &crate::doc_refs::DocRefs,
     ) -> io::Result<()> {
         let module_dir = format!("{}/{}", c_include_root, api_def.module.as_str());
         std::fs::create_dir_all(&module_dir)?;
@@ -136,7 +137,8 @@ impl Cgen {
             writeln!(f, "#endif")?;
         }
 
-        std::fs::write(&filename, f)
+        let header = String::from_utf8(f).map_err(io::Error::other)?;
+        std::fs::write(&filename, doc_refs.to_c(&header))
     }
 
     /// Emit a def's real types into its header, in the one order C accepts: enums,
@@ -1147,6 +1149,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("generate header");
 
@@ -1589,6 +1592,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join(api_def.module.as_str()).join("settings.h"))
@@ -2654,6 +2658,7 @@ mod tests {
                 None,
                 "scripts/gen.sh",
                 license,
+                &crate::doc_refs::DocRefs::default(),
             )
             .expect("header");
             std::fs::read_to_string(dir.join("lic").join("lic.h")).expect("read lic.h")
@@ -2702,6 +2707,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("view").join("view.h")).expect("read view.h");
@@ -2756,6 +2762,7 @@ mod tests {
             None,
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("view").join("view.h")).expect("read view.h");
@@ -2819,6 +2826,7 @@ mod tests {
                 asserts,
                 "scripts/gen.sh",
                 None,
+                &crate::doc_refs::DocRefs::default(),
             )
             .expect("header");
             std::fs::read_to_string(dir.join("pin").join("pin.h")).expect("read pin.h")
@@ -2883,6 +2891,7 @@ mod tests {
             Some(&registry),
             "scripts/gen.sh",
             None,
+            &crate::doc_refs::DocRefs::default(),
         )
         .expect("header");
         let header = std::fs::read_to_string(dir.join("pin").join("pin.h")).expect("read pin.h");
