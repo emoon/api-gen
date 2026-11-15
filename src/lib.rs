@@ -262,17 +262,19 @@ fn defs_in(dir: &Path) -> Result<Vec<PathBuf>, Error> {
 
 /// Fail when a doc comment names a member that its type or api block does not have.
 fn check_doc_refs(doc_refs: &DocRefs, emitted: &[&ApiDef]) -> Result<(), Error> {
-    for def in emitted {
-        let missing = doc_refs.unresolved(def);
-        if !missing.is_empty() {
-            return Err(Error::Idl(format!(
-                "doc comment reference(s) in {} name nothing in the IDL:\n{}",
-                def.filename,
-                missing.join("\n")
-            )));
-        }
+    let missing: Vec<String> = emitted
+        .iter()
+        .map(|def| (def, doc_refs.unresolved(def)))
+        .filter(|(_, refs)| !refs.is_empty())
+        .map(|(def, refs)| format!("{}:\n{}", def.filename, refs.join("\n")))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    Err(Error::Idl(format!(
+        "doc comment reference(s) name nothing in the IDL:\n{}",
+        missing.join("\n")
+    )))
 }
 
 pub fn generate(cfg: &Config) -> Result<Summary, Error> {

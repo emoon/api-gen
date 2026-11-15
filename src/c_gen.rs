@@ -790,7 +790,7 @@ impl Cgen {
             // convenience macro would shadow the real function and rewrite
             // sb_clear(sb) into sb_clear((FlStringBuilder){ sb }), a type error.
             // The same is true of a `[scope_end]` slot on any block.
-            if !api.is_service && !func.is_scope_end && convenience_config_arg(func).is_some() {
+            if has_convenience_macro(api, func) {
                 if func.c_name.ends_with("_impl") {
                     Self::generate_convenience_macro(f, func, naming)?;
                 } else {
@@ -1005,6 +1005,22 @@ fn callback_values(api_def: &ApiDef) -> impl Iterator<Item = &Variable> {
 /// builds: config bags a caller fills field by field. Handles, ids, colors, events
 /// and other whole values are passed as plain expressions and never wrapped.
 const CONFIG_TYPE_SUFFIX: &str = "Config";
+
+/// Whether an api slot gets a designated-initializer convenience macro. A
+/// `#[attributes(service)]` block and a `[scope_end]` slot never do.
+fn has_convenience_macro(api: &Api, func: &Function) -> bool {
+    !api.is_service && !func.is_scope_end && convenience_config_arg(func).is_some()
+}
+
+/// The name a C caller writes to call an api slot: the convenience macro when the
+/// slot has one, which drops an `_impl` suffix, else the exported function.
+pub(crate) fn c_call_name(api: &Api, func: &Function) -> String {
+    if has_convenience_macro(api, func) {
+        Cgen::convenience_call_macro_name(func)
+    } else {
+        func.c_name.clone()
+    }
+}
 
 /// The trailing by-value config struct of an api slot, if any - the arg a
 /// designated-initializer convenience macro builds from __VA_ARGS__. It is the

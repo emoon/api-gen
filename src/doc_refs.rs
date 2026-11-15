@@ -27,7 +27,10 @@ impl DocRefs {
             for api in &def.apis {
                 refs.owners.insert(api.name.clone());
                 for func in &api.functions {
-                    refs.add_func(&api.name, &func.name, &func.c_name);
+                    refs.c_names.insert(
+                        format!("{}::{}", api.name, func.name),
+                        crate::c_gen::c_call_name(api, func),
+                    );
                 }
             }
             for cb in &def.callbacks {
@@ -45,23 +48,20 @@ impl DocRefs {
         self.c_names.insert(name.to_owned(), c_name);
     }
 
-    /// A C caller writes the convenience macro, which drops the `_impl` suffix.
-    fn add_func(&mut self, owner: &str, name: &str, c_name: &str) {
-        let call_name = c_name.strip_suffix("_impl").unwrap_or(c_name);
-        self.c_names
-            .insert(format!("{owner}::{name}"), call_name.to_owned());
-    }
-
     fn add_struct(&mut self, s: &Struct, naming: &Naming) {
         let c_type = naming.c_type(&s.name);
-        for var in &s.variables {
+        for var in struct_fields(s) {
             self.c_names.insert(
                 format!("{}.{}", s.name, var.name),
                 format!("{}.{}", c_type, var.name),
             );
         }
+        // A struct's function is a function-pointer field in C.
         for func in &s.functions {
-            self.add_func(&s.name, &func.name, &func.c_name);
+            self.c_names.insert(
+                format!("{}::{}", s.name, func.name),
+                format!("{}.{}", c_type, func.name),
+            );
         }
         self.add_type(&s.name, c_type);
     }
@@ -82,8 +82,8 @@ impl DocRefs {
     pub fn unresolved(&self, def: &ApiDef) -> Vec<String> {
         let mut missing = Vec::new();
         for (item, comments) in doc_blocks(def) {
-            for span in comments.iter().flat_map(|line| backtick_spans(line)) {
-                if self.is_unresolved(span) {
+            for (span, quoted) in comments.iter().flat_map(|line| spans(line)) {
+                if quoted && self.is_unresolved(span) {
                     missing.push(format!("  {item}: `{span}`"));
                 }
             }
@@ -92,8 +92,9 @@ impl DocRefs {
     }
 
     fn is_unresolved(&self, span: &str) -> bool {
-        match member_owner(span) {
-            Some(owner) => self.owners.contains(owner) && !self.c_names.contains_key(span),
+        let name = call_target(span);
+        match member_owner(name) {
+            Some(owner) => self.owners.contains(owner) && !self.c_names.contains_key(name),
             None => false,
         }
     }
@@ -113,24 +114,48 @@ impl DocRefs {
 
     fn line_to_c(&self, line: &str) -> String {
         let mut out = String::with_capacity(line.len());
-        for (i, part) in line.split('`').enumerate() {
+        for (i, (span, quoted)) in spans(line).enumerate() {
             if i > 0 {
                 out.push('`');
             }
-            let in_backticks = i % 2 == 1;
-            match self.c_names.get(part) {
-                Some(c_name) if in_backticks => out.push_str(c_name),
-                _ => out.push_str(part),
+            let name = call_target(span);
+            match self.c_names.get(name) {
+                Some(c_name) if quoted => {
+                    out.push_str(c_name);
+                    out.push_str(&span[name.len()..]);
+                }
+                _ => out.push_str(span),
             }
         }
         out
     }
 }
 
-/// The text between each pair of backticks on a line.
-fn backtick_spans(line: &str) -> impl Iterator<Item = &str> {
-    let closed = line.matches('`').count() / 2;
-    line.split('`').skip(1).step_by(2).take(closed)
+/// line split at its backticks, each piece with whether a closed pair quotes it.
+fn spans(line: &str) -> impl Iterator<Item = (&str, bool)> {
+    let last = line.matches('`').count();
+    line.split('`')
+        .enumerate()
+        .map(move |(i, span)| (span, i % 2 == 1 && i < last))
+}
+
+/// A reference written as a call, `List::begin()`, names `List::begin`.
+fn call_target(span: &str) -> &str {
+    span.strip_suffix("()").unwrap_or(span)
+}
+
+/// The fields a reference can name: the struct's own, plus the arms of an unnamed
+/// union, which C reaches directly off the struct.
+fn struct_fields(s: &Struct) -> impl Iterator<Item = &crate::api_parser::Variable> {
+    s.variables.iter().flat_map(|var| {
+        let arms = match &var.union_variants {
+            Some(arms) if var.name.is_empty() => arms.as_slice(),
+            _ => &[],
+        };
+        std::iter::once(var)
+            .filter(|var| !var.name.is_empty())
+            .chain(arms)
+    })
 }
 
 /// The owner in an `Owner::member` or `Owner.member` reference, when span is one.
@@ -148,6 +173,9 @@ fn doc_blocks(def: &ApiDef) -> Vec<(String, &Vec<String>)> {
         blocks.push((s.name.clone(), &s.doc_comments));
         for var in &s.variables {
             blocks.push((format!("{}.{}", s.name, var.name), &var.doc_comments));
+            for arm in var.union_variants.iter().flatten() {
+                blocks.push((format!("{}.{}", s.name, arm.name), &arm.doc_comments));
+            }
         }
         for func in &s.functions {
             blocks.push((format!("{}::{}", s.name, func.name), &func.doc_comments));
@@ -190,8 +218,12 @@ mod tests {
             /// Starts a list. Read `ListResult.requests`, a `ListResult`.
             begin(count: u32) -> u32
             end() -> ListResult
-            new_impl(count: u32)
-        }";
+            show_impl(config: ListConfig)
+            raw_impl(count: u32)
+        }
+        struct ListConfig { gap: f32 }
+        struct Backend { poll() -> bool }
+        struct Event { union { moved: u32, key: u32 } }";
 
     fn parse(source: &str) -> Vec<ApiDef> {
         let mut def = ApiDef::default();
@@ -209,11 +241,13 @@ mod tests {
     fn comment_lines_name_the_c_spelling() {
         let defs = parse(LIST_DEF);
         let header = "// Call `List::begin`, read `ListResult.requests` of a `ListResult`.\n\
-                      // `DropRelationship::Before`, `List::new_impl` and `count`.\n";
+                      // `DropRelationship::Before`, `List::end()` and `count`.\n\
+                      // `List::show_impl`, `List::raw_impl`, `Backend::poll`, `Event.key`.\n";
         assert_eq!(
             refs(&defs).to_c(header),
             "// Call `fl_list_begin`, read `FlListResult.requests` of a `FlListResult`.\n\
-             // `FlDropRelationship_Before`, `fl_list` and `count`.\n"
+             // `FlDropRelationship_Before`, `fl_list_end()` and `count`.\n\
+             // `fl_list_show`, `fl_list_raw_impl`, `FlBackend.poll`, `FlEvent.key`.\n"
         );
     }
 
@@ -236,14 +270,14 @@ mod tests {
         let defs = parse(
             "struct ListResult { requests: u32 }
              api List {
-                 /// See `List::start`, `ListResult.count`, `Other::thing` and `a.b`.
+                 /// See `List::start()`, `ListResult.count`, `Other::thing` and `a.b`.
                  begin()
              }",
         );
         assert_eq!(
             refs(&defs).unresolved(&defs[0]),
             vec![
-                "  List::begin: `List::start`",
+                "  List::begin: `List::start()`",
                 "  List::begin: `ListResult.count`"
             ]
         );
