@@ -12,6 +12,7 @@ pub mod naming;
 pub mod pairing;
 mod read_gen;
 mod rust_gen;
+mod safe_event_gen;
 mod test_gen;
 
 #[macro_use]

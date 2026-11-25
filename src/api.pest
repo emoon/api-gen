@@ -155,7 +155,17 @@ fieldsep  = _{ (",") }
 // whose arms are accessed directly off the struct (`event.move.x`) — the shape the
 // hand-written input event structs use. Listed before `var` in `field` because
 // `var` would otherwise read `name : union` with `union` as a type name.
-union_field = { (name ~ (":"))? ~ ("union") ~ ("{") ~ varlist ~ ("}") }
+union_field = { (name ~ (":"))? ~ ("union") ~ union_tag? ~ ("{") ~ union_varlist ~ ("}") }
+
+// `union(<tag field>) { [tag(<Variant>, ...)] arm: Type, ... }` — a tagged union. The
+// parenthesised name is the sibling enum field that says which arm is live, and each
+// arm's `[tag(...)]` lists the enum variants it carries a payload for. An enum variant no
+// arm names has no payload. The Rust binding turns the tag and the union into a safe enum
+// whose variants carry their payload. Untagged unions keep `union { ... }` and `varlist`.
+union_tag     = { ("(") ~ name ~ (")") }
+union_varlist = { union_var ~ ((",") ~ union_var)* }
+union_var     = { tag_attr? ~ var }
+tag_attr      = { ("[tag(") ~ namelist ~ (")]") }
 
 // `#[enumerators(<Stem>)]` overrides the C enumerator prefix stem. By default a
 // variant spells `<Prefix><EnumName>_<Variant>` (e.g. `FlKey_A`). When a hand-
