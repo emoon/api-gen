@@ -594,7 +594,11 @@ impl RustGen {
         })
     }
 
-    fn write_comment<W: Write>(f: &mut W, comments: &[String], indent: usize) -> io::Result<()> {
+    pub(crate) fn write_comment<W: Write>(
+        f: &mut W,
+        comments: &[String],
+        indent: usize,
+    ) -> io::Result<()> {
         for c in comments {
             // A blank line inside a multi-paragraph doc block emits a bare ///
             // (no trailing space).
@@ -650,7 +654,7 @@ impl RustGen {
     /// Rust spelling of any value - a struct field, union variant, method arg, or
     /// return - as the base type plus any pointer qualifier. A union field is
     /// special-cased by its caller, which names the generated union type instead.
-    fn rust_field_type(root: &str, var: &Variable) -> String {
+    pub(crate) fn rust_field_type(root: &str, var: &Variable) -> String {
         let base = Self::apply_pointer(var, Self::rust_base_type(root, var));
         match &var.array {
             // Unsized arrays are pointer+length args handled by the signature path.
@@ -676,7 +680,7 @@ impl RustGen {
     /// anonymous union members, so a C anonymous union (field.name empty) gets a
     /// synthetic payload field of a `<Struct>Payload` union type; a named union keeps
     /// its own name and `<Struct><Field>` type.
-    fn union_field_spelling(struct_name: &str, field: &Variable) -> (String, String) {
+    pub(crate) fn union_field_spelling(struct_name: &str, field: &Variable) -> (String, String) {
         if field.name.is_empty() {
             ("payload".to_owned(), format!("{}Payload", struct_name))
         } else {
@@ -694,7 +698,7 @@ impl RustGen {
     /// raw identifiers (`r#self` does not parse), so they take a trailing underscore
     /// (self_) instead. `#[repr(C)]` layout is field-name-independent, so the rename
     /// is ABI-neutral; the offset_of! guard names the same escaped ident.
-    fn rust_ident(name: &str) -> String {
+    pub(crate) fn rust_ident(name: &str) -> String {
         match name {
             // Strict keywords plus the reserved-for-future-use set, across all editions
             // rather than the one the output is compiled at today (gen is reserved
@@ -1326,6 +1330,7 @@ impl RustGen {
             Self::generate_callback_alias(&mut f, root, cb)?;
         }
 
+        let mut checked_enums = std::collections::BTreeSet::new();
         for sdef in &api_def.structs {
             if sdef.is_handle_type {
                 Self::generate_handle_newtype(&mut f, sdef)?;
@@ -1333,8 +1338,12 @@ impl RustGen {
                 Self::generate_opaque_type(&mut f, sdef)?;
             } else {
                 Self::generate_data_struct(&mut f, root, sdef, reg)?;
+                checked_enums.extend(crate::safe_event_gen::generate(
+                    &mut f, root, api_def, sdef,
+                )?);
             }
         }
+        crate::safe_event_gen::write_from_raw(&mut f, api_def, &checked_enums)?;
 
         // Emitted after the domain's data types so the signatures can name them. A
         // `#[attributes(service)]` block is no different - it declares the same
@@ -3668,13 +3677,13 @@ impl RustGen {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::api_parser::{ApiDef, ApiParser};
     use std::process::Command;
 
     /// rustc if present (else the test skips), for compiling generated bindings.
-    fn find_rustc() -> Option<&'static str> {
+    pub(crate) fn find_rustc() -> Option<&'static str> {
         Command::new("rustc")
             .arg("--version")
             .output()
@@ -3685,7 +3694,7 @@ mod tests {
 
     /// Compile a standalone Rust snippet as a library (metadata-only, no codegen)
     /// and report whether it built. tag keeps the temp path unique per case.
-    fn rustc_compiles(rustc: &str, tag: &str, src: &str) -> bool {
+    pub(crate) fn rustc_compiles(rustc: &str, tag: &str, src: &str) -> bool {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("api_gen_rs_{}_{}.rs", std::process::id(), tag));
         std::fs::write(&path, src).expect("write temp rs");
@@ -3708,7 +3717,7 @@ mod tests {
     /// the shared //! SAFETY: statement and any `#![...]` attribute. Tests that
     /// compile generated output splice it after stand-in stubs, where file-scoped
     /// items would no longer be legal.
-    fn strip_file_header(out: &str) -> String {
+    pub(crate) fn strip_file_header(out: &str) -> String {
         out.lines()
             .skip_while(|l| {
                 l.trim().is_empty()
@@ -3720,7 +3729,7 @@ mod tests {
             .join("\n")
     }
 
-    fn parse_one(defs: &str, file: &str) -> ApiDef {
+    pub(crate) fn parse_one(defs: &str, file: &str) -> ApiDef {
         let mut api_def = ApiDef::default();
         ApiParser::parse_string(defs, file, &mut api_def);
         ApiParser::second_pass(std::slice::from_mut(&mut api_def), &crate::naming::FL);

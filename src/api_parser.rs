@@ -76,6 +76,12 @@ pub struct Variable {
     /// Some when this field is an anonymous union { ... }. Holds the union's
     /// variant fields; name is the union field's name and type_name is unused.
     pub union_variants: Option<Vec<Variable>>,
+    /// Some when this field is a tagged union (`union(<tag field>) { ... }`): the
+    /// name of the sibling enum field that says which arm is live.
+    pub union_tag: Option<String>,
+    /// `[tag(<Variant>, ...)]` on a union arm: the tag enum's variants this arm
+    /// carries the payload of. Empty on every other value.
+    pub tags: Vec<String>,
     /// Some(T) when this api arg carries a `[slice(T)]` / `[slice_mut(T)]` marker:
     /// it is the data pointer of a (pointer, count) pair, and the Rust façade
     /// collapses it and the immediately-following count arg into a single `&[T]` /
@@ -204,6 +210,8 @@ impl Default for Variable {
             opaque_view: None,
             is_callback: false,
             union_variants: None,
+            union_tag: None,
+            tags: Vec::new(),
             slice_elem: None,
             slice_mut: false,
             array_param: None,
@@ -1032,11 +1040,13 @@ impl ApiParser {
         for entry in rule.into_inner() {
             match entry.as_rule() {
                 Rule::name => var.name = entry.as_str().to_owned(),
-                Rule::varlist => {
-                    for v in entry.into_inner() {
-                        if v.as_rule() == Rule::var {
-                            variants.push(Self::get_variable(v, &[]));
-                        }
+                Rule::union_tag => {
+                    var.union_tag =
+                        Some(Self::first_child_str(entry, Rule::name).expect("tag name"));
+                }
+                Rule::union_varlist => {
+                    for union_var in entry.into_inner() {
+                        variants.push(Self::get_union_variant(union_var));
                     }
                 }
                 _ => (),
@@ -1045,6 +1055,26 @@ impl ApiParser {
 
         var.union_variants = Some(variants);
         var
+    }
+
+    /// Parse one union arm: an ordinary variable, with the `[tag(...)]` names that
+    /// precede it.
+    fn get_union_variant(rule: Pair<Rule>) -> Variable {
+        let mut tags = Vec::new();
+        let mut variant = Variable::default();
+        for entry in rule.into_inner() {
+            match entry.as_rule() {
+                Rule::tag_attr => {
+                    for namelist in entry.into_inner() {
+                        tags.extend(namelist.into_inner().map(|n| n.as_str().to_owned()));
+                    }
+                }
+                Rule::var => variant = Self::get_variable(entry, &[]),
+                _ => (),
+            }
+        }
+        variant.tags = tags;
+        variant
     }
 
     fn get_function(rule: Pair<Rule>, doc_comments: &[String]) -> Function {
@@ -1523,6 +1553,94 @@ impl ApiParser {
         }
     }
 
+    /// Check the `union(<tag>)` / `[tag(...)]` annotations of one struct: a tagged
+    /// union names a sibling enum field before it, every arm names at least one of that
+    /// enum's variants, and no variant is named twice. The enum variants no arm names
+    /// are the ones without a payload. An arm tag on an untagged union is refused.
+    fn validate_tagged_unions(
+        s: &Struct,
+        enum_variants: &HashMap<String, Vec<String>>,
+        local_enums: &HashSet<String>,
+    ) {
+        let unions = s
+            .variables
+            .iter()
+            .filter(|v| v.union_variants.is_some())
+            .count();
+        let tagged = s.variables.iter().any(|v| v.union_tag.is_some());
+        assert!(
+            !tagged || unions == 1,
+            "api_gen: {}: a struct with a tagged union has no other union, but this one has {unions}",
+            s.name
+        );
+        if tagged {
+            // The safe struct spells the tag enum as `kind`, and the union is the `payload` field.
+            for var in s.variables.iter().filter(|v| v.union_variants.is_none()) {
+                assert!(
+                    var.name != "kind" && var.name != "payload",
+                    "api_gen: {}: a field of a struct with a tagged union cannot be named `{}`; the safe event uses that name",
+                    s.name,
+                    var.name
+                );
+            }
+        }
+        for (index, var) in s.variables.iter().enumerate() {
+            let Some(arms) = &var.union_variants else {
+                continue;
+            };
+            let where_ = &s.name;
+            let Some(tag) = &var.union_tag else {
+                assert!(
+                    arms.iter().all(|arm| arm.tags.is_empty()),
+                    "api_gen: {where_}: an arm has `[tag(...)]` but the union has no tag field; write `union(<tag field>) {{ ... }}`"
+                );
+                continue;
+            };
+            assert!(
+                var.name.is_empty(),
+                "api_gen: {where_}: a tagged union must be anonymous, but this one is named `{}`",
+                var.name
+            );
+            let tag_var = s.variables[..index]
+                .iter()
+                .find(|v| v.name == *tag)
+                .unwrap_or_else(|| {
+                    panic!("api_gen: {where_}: the union's tag field `{tag}` is not a field before the union")
+                });
+            assert!(
+                local_enums.contains(&tag_var.type_name) || !enum_variants.contains_key(&tag_var.type_name),
+                "api_gen: {where_}: the tag enum `{}` must be defined in the same def as the struct",
+                tag_var.type_name
+            );
+            let variants = enum_variants
+                .get(&tag_var.type_name)
+                .filter(|_| !tag_var.pointer && !tag_var.const_pointer && tag_var.array.is_none())
+                .unwrap_or_else(|| {
+                    panic!("api_gen: {where_}: the union's tag field `{tag}` must be a plain enum, not `{}`", tag_var.type_name)
+                });
+            let mut claimed: HashSet<&str> = HashSet::new();
+            for arm in arms {
+                assert!(
+                    !arm.tags.is_empty(),
+                    "api_gen: {where_}: arm `{}` of the tagged union has no `[tag(...)]`",
+                    arm.name
+                );
+                for name in &arm.tags {
+                    assert!(
+                        variants.contains(name),
+                        "api_gen: {where_}: `[tag({name})]` is not a variant of `{}`",
+                        tag_var.type_name
+                    );
+                    assert!(
+                        claimed.insert(name),
+                        "api_gen: {where_}: variant `{name}` of `{}` is the tag of two arms",
+                        tag_var.type_name
+                    );
+                }
+            }
+        }
+    }
+
     /// Second pass: resolve cross-file type kinds (enum/handle/empty-struct) on
     /// function args/returns and assign each function its C name.
     pub fn second_pass(api_defs: &mut [ApiDef], naming: &crate::naming::Naming) {
@@ -1537,6 +1655,8 @@ impl ApiParser {
         let mut mirror_defs: Vec<(&Struct, &str)> = Vec::new();
         let mut enums_without_zero = HashSet::new();
         let mut opaque_structs = HashSet::new();
+        // Regular enum -> its variant names, for checking a tagged union's `[tag(...)]`.
+        let mut enum_variants: HashMap<String, Vec<String>> = HashMap::new();
 
         for api_def in api_defs.iter() {
             for s in &api_def.structs {
@@ -1555,6 +1675,15 @@ impl ApiParser {
             }
             for e in &api_def.enums {
                 enum_names.insert(e.name.to_owned());
+                if e.enum_type == EnumType::Regular {
+                    enum_variants.insert(
+                        e.name.to_owned(),
+                        e.entries
+                            .iter()
+                            .map(|entry| entry.name.to_owned())
+                            .collect(),
+                    );
+                }
                 if e.enum_type == EnumType::Regular && !Self::enum_has_zero_value(e) {
                     enums_without_zero.insert(e.name.to_owned());
                 }
@@ -1575,6 +1704,8 @@ impl ApiParser {
         let mirrors = Self::resolve_mirrors(&mirror_defs);
 
         for api_def in api_defs.iter_mut() {
+            let local_enums: HashSet<String> =
+                api_def.enums.iter().map(|e| e.name.to_owned()).collect();
             for s in &mut api_def.structs {
                 // A struct value field typed by an extern opaque dep must spell
                 // verbatim too, so flag it the same way as a function-field arg.
@@ -1583,6 +1714,7 @@ impl ApiParser {
                         var.is_extern_opaque = true;
                     }
                 }
+                Self::validate_tagged_unions(s, &enum_variants, &local_enums);
                 // Must run after the extern opaque annotation above, which the
                 // validation reads to reject a pointer to an uninhabited host type.
                 if s.is_mirror() {
